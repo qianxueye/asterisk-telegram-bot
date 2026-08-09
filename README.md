@@ -1,6 +1,12 @@
 # Asterisk Telegram Bot
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 基于Telethon API开发的高性能Telegram机器人，用于控制Asterisk系统发送短信、查询设备状态和智能检测Silent SMS。
+
+## 许可证
+
+本项目采用 [MIT License](LICENSE)。
 
 ## 🚀 功能特性
 
