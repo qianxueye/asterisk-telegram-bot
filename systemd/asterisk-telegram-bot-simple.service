@@ -1,0 +1,33 @@
+[Unit]
+Description=Asterisk Telegram Bot with Telethon Integration
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+WorkingDirectory=%h/Asterisk-Telegram-Bot
+Environment=PATH=%h/Asterisk-Telegram-Bot/venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PYTHONPATH=%h/Asterisk-Telegram-Bot
+ExecStart=%h/Asterisk-Telegram-Bot/venv/bin/python %h/Asterisk-Telegram-Bot/asterisk_bot.py
+
+# 重启配置（防止快速重启错误）
+Restart=on-failure
+RestartSec=10
+StartLimitInterval=300
+StartLimitBurst=5
+
+# 超时配置
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+# 日志配置
+StandardOutput=journal
+StandardError=journal
+
+# 环境变量文件
+EnvironmentFile=-%h/Asterisk-Telegram-Bot/.env
+
+[Install]
+WantedBy=multi-user.target

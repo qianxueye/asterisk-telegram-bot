@@ -1,0 +1,20 @@
+# Secrets and local runtime state
+.env
+*.session
+*.session-journal
+asterisk_bot_session*
+asterisk_sms_pipe
+.uac_recovery_state.json
+backups/
+Todo
+
+# Python environments and generated files
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+coverage.xml
+
+# OS/editor metadata
+.DS_Store
+.vscode/

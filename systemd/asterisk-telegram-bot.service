@@ -1,0 +1,61 @@
+[Unit]
+Description=Asterisk Telegram Bot with Telethon Integration
+After=network.target network-online.target
+Wants=network-online.target
+# 添加更多依赖确保网络完全就绪
+After=systemd-resolved.service
+Wants=systemd-resolved.service
+After=asterisk.service
+
+[Service]
+Type=simple
+User=%i
+Group=%i
+WorkingDirectory=/home/%i/Asterisk-Telegram-Bot
+
+# 更完整的环境变量设置
+Environment=PATH=/home/%i/Asterisk-Telegram-Bot/venv/bin:/usr/local/bin:/usr/bin:/bin:/sbin:/usr/sbin
+Environment=PYTHONPATH=/home/%i/Asterisk-Telegram-Bot
+Environment=PYTHONUNBUFFERED=1
+Environment=HOME=/home/%i
+
+# 启动命令 - 添加更多调试信息
+ExecStartPre=/bin/bash -c 'cd /home/%i/Asterisk-Telegram-Bot && test -f .env || (echo "错误: .env文件不存在" && exit 1)'
+ExecStartPre=/bin/bash -c 'cd /home/%i/Asterisk-Telegram-Bot && test -x venv/bin/python || (echo "错误: Python虚拟环境不可执行" && exit 1)'
+ExecStartPre=/bin/bash -c 'cd /home/%i/Asterisk-Telegram-Bot && venv/bin/python -c "import asterisk_bot, config" || (echo "错误: 项目模块导入失败" && exit 1)'
+ExecStartPre=/bin/sleep 5
+ExecStart=/home/%i/Asterisk-Telegram-Bot/venv/bin/python /home/%i/Asterisk-Telegram-Bot/asterisk_bot.py
+
+# 重启配置 - 网络波动或异常退出后自动恢复
+Restart=always
+RestartSec=10
+StartLimitInterval=600
+StartLimitBurst=10
+
+# 超时配置 - 给更多时间启动
+TimeoutStartSec=120
+TimeoutStopSec=30
+
+# 日志配置
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=asterisk-telegram-bot
+
+# 环境变量文件
+EnvironmentFile=-/home/%i/Asterisk-Telegram-Bot/.env
+
+# 安全配置
+NoNewPrivileges=false
+PrivateTmp=false
+ProtectSystem=false
+ProtectHome=false
+# 允许访问Asterisk日志和SMS管道
+ReadWritePaths=/var/log/asterisk
+ReadWritePaths=/tmp
+
+# 资源限制
+MemoryMax=512M
+TasksMax=50
+
+[Install]
+WantedBy=multi-user.target

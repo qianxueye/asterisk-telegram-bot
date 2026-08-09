@@ -1,0 +1,20 @@
+[Unit]
+Description=Asterisk ZeroTier/PJSIP Network Watchdog
+After=network-online.target zerotier-one.service asterisk.service
+Wants=network-online.target zerotier-one.service
+
+[Service]
+Type=simple
+User=qianxueye
+Group=qianxueye
+WorkingDirectory=/home/qianxueye/Asterisk-Telegram-Bot
+EnvironmentFile=-/home/qianxueye/Asterisk-Telegram-Bot/asterisk-network-watchdog.env
+ExecStart=/home/qianxueye/Asterisk-Telegram-Bot/asterisk_network_watchdog.sh
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=asterisk-network-watchdog
+
+[Install]
+WantedBy=multi-user.target

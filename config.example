@@ -1,0 +1,130 @@
+# Asterisk Telegram Bot 配置文件示例
+# 复制此文件为 .env 并填入正确的配置信息
+
+# ===========================================
+# Telegram Bot 配置
+# ===========================================
+# 从 @BotFather 获取的 Bot Token
+BOT_TOKEN=your_bot_token_here
+
+# Telethon API 配置（从 https://my.telegram.org 获取）
+# 访问 https://my.telegram.org 登录后创建应用获取
+API_ID=your_api_id_here
+API_HASH=your_api_hash_here
+
+# ===========================================
+# 授权用户管理
+# ===========================================
+# 授权用户ID列表，用逗号分隔
+# 可以通过与机器人私聊获取用户ID
+AUTHORIZED_USERS=123456789,987654321,555666777
+
+# ===========================================
+# Asterisk 系统配置
+# ===========================================
+# Asterisk命令前缀，用于执行Asterisk CLI命令
+# 
+# systemd 服务运行时使用 sudo:
+ASTERISK_COMMAND_PREFIX=sudo asterisk -rx
+ASTERISK_STARTUP_DELAY_SECONDS=5
+ASTERISK_LOG_FILE=/var/log/asterisk/full.log
+SMS_PIPE_PATH=/home/qianxueye/Asterisk-Telegram-Bot/asterisk_sms_pipe
+
+# Telegram网络恢复
+TELEGRAM_CONNECT_RETRY_MIN_SECONDS=5
+TELEGRAM_CONNECT_RETRY_MAX_SECONDS=300
+#
+# 注意: 需要配置以下两项才能在 systemd 服务中使用 sudo:
+#   1. 配置 sudoers 允许无密码执行 asterisk 命令
+#   2. 修改 systemd 服务设置 NoNewPrivileges=false
+#
+# 运行配置脚本: sudo ./fix_systemd_sudo.sh
+# 该脚本会自动完成上述配置
+#
+# 手动运行时（不使用 systemd 服务）:
+# ASTERISK_COMMAND_PREFIX=sudo asterisk -rx  (需要sudo权限)
+# 或
+# ASTERISK_COMMAND_PREFIX=asterisk -rx  (如果配置了socket权限)
+
+# ===========================================
+# 代理配置（可选）
+# ===========================================
+# 代理类型: http, socks4, socks5, mtproto
+# 按部署环境填写代理地址；不应提交真实的生产地址或凭据。
+PROXY_TYPE=socks5
+PROXY_HOST=proxy.example.internal
+PROXY_PORT=1080
+PROXY_RDNS=true
+# PROXY_USERNAME=
+# PROXY_PASSWORD=
+
+# ===========================================
+# Quectel 本机号码恢复
+# ===========================================
+# 部分Quectel/Qualcomm模块掉电后AT+CNUM不会返回MSISDN，
+# 需要先切换phonebook偏好再查询。
+PHONEBOOK_PREF_COMMAND=AT$QCPBMPREF=1
+PHONE_RECOVERY_INTERVAL_SECONDS=300
+PHONE_RECOVERY_NOTICE_INTERVAL_SECONDS=1800
+PHONE_RECOVERY_EXPECTED_NUMBERS=+8613800138000
+
+# ===========================================
+# Quectel UAC 观测与故障触发软恢复
+# ===========================================
+# 仅在日志错误突发或严重错误时执行 `quectel restart when convenient`；
+# 不会自动执行 UAC apply、AT+CFUN 或 modem reset。
+UAC_AUTO_RECOVERY_ENABLED=true
+UAC_AUTO_RECOVERY_DEVICES=quectel1
+UAC_ERROR_THRESHOLD=25
+UAC_ERROR_WINDOW_SECONDS=5
+UAC_RECOVERY_COOLDOWN_SECONDS=3600
+UAC_RECOVERY_MAX_PER_DAY=2
+UAC_RECOVERY_STATE_FILE=./.uac_recovery_state.json
+# 演练 Telegram 流程时设为 true，所有恢复 CLI 均只记录、不执行。
+UAC_RECOVERY_DRY_RUN=false
+
+# ===========================================
+# 可选配置
+# ===========================================
+# 日志级别 (DEBUG, INFO, WARNING, ERROR)
+LOG_LEVEL=INFO
+
+# 机器人名称（用于日志显示）
+BOT_NAME=AsteriskBot
+
+# 最大短信长度限制
+MAX_SMS_LENGTH=160
+
+# 设备查询超时时间（秒）
+DEVICE_QUERY_TIMEOUT=30
+
+# ===========================================
+# 使用说明
+# ===========================================
+# 1. 获取 Bot Token：
+#    - 在 Telegram 中找到 @BotFather
+#    - 发送 /newbot 命令创建新机器人
+#    - 按照提示设置机器人名称和用户名
+#    - 获取 Bot Token
+#
+# 2. 获取 API ID 和 API Hash：
+#    - 访问 https://my.telegram.org
+#    - 登录您的 Telegram 账号
+#    - 进入 "API Development Tools"
+#    - 创建一个应用
+#    - 获取 API ID 和 API Hash
+#
+# 3. 获取用户ID：
+#    - 与您的机器人私聊
+#    - 发送任意消息
+#    - 查看机器人日志获取用户ID
+#
+# 4. 代理配置（如果需要）：
+#    - HTTP代理: PROXY_TYPE=http, PROXY_HOST=代理地址, PROXY_PORT=端口
+#    - SOCKS5代理: PROXY_TYPE=socks5, PROXY_HOST=代理地址, PROXY_PORT=端口
+#    - MTProto代理: PROXY_TYPE=mtproto, PROXY_HOST=代理地址, PROXY_PORT=端口, PROXY_PASSWORD=密钥
+#
+# 5. 配置完成后：
+#    - 运行 pip install -r requirements.txt 安装依赖
+#    - 运行 python asterisk_bot.py 启动机器人
+#    - 或使用 systemctl start asterisk-bot 启动服务
