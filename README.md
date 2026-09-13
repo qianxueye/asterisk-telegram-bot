@@ -24,6 +24,26 @@
 - 💾 **日志缓存**: 3分钟窗口缓存，减少日志访问80%
 - 🔄 **自动重启**: 系统服务支持自动重启和故障恢复
 
+## 普通短信展示与验证码
+
+普通来信使用简短标题、普通文本正文、来源信息的顺序。正文不再放进 Telegram 的代码块，便于在通知预览中尽早看到短信内容；回复后或取消回复时也恢复同一布局。
+
+例如（以下号码与内容均为示例）：
+
+```text
+📩 新短信
+
+【示例服务】您的验证码是 123456，5 分钟内有效。
+
+设备 quectel1 +12025550100
+来自 +12025550101
+时间 2026-09-13 08:00:00
+```
+
+短信原文保留在回复记录中，展示时转义 HTML 特殊字符，不提取或改写数字。普通短信链接的预览关闭；Silent SMS 诊断及发送/回复编辑中的代码块保持原有用途。
+
+**系统自动填充的边界：** 这项改进优化 Telegram 消息展示和通知内容，不承诺开启系统级验证码自动填充。Apple 的 [SMS 自动填充说明](https://support.apple.com/guide/iphone/automatically-fill-in-sms-passcodes-iphc89a3a3af/ios) 描述的是从“信息”中接收的 SMS；Android 的 [SMS Retriever](https://developers.google.com/identity/sms-retriever/overview) 也依赖设备收到 SMS。Telegram Bot 转发消息并不是这些系统 SMS 通道。不同客户端上的实际识别与复制行为需要分别验证。
+
 ## 📋 系统要求
 
 - **操作系统**: Linux (推荐Ubuntu 20.04+ 或 CentOS 7+)

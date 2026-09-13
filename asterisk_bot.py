@@ -358,22 +358,23 @@ class AsteriskBot:
         return message
     
     def format_original_sms_message(self, sms_info: dict) -> str:
-        """格式化原始SMS消息"""
+        """普通来信正文优先展示；代码块仅保留给发送/回复编辑流程。"""
         device_id = sms_info.get('device', 'Unknown')
+        device_display = sms_info.get('device_display') or device_id
         sender = sms_info.get('sender', 'Unknown')
         content = sms_info.get('content', '')
         timestamp = sms_info.get('timestamp', '')
-        
-        message = f"""
-📩 <b>新短信</b>
+        body = "<i>(空内容)</i>" if content is None or content == "" else self.escape_html(content)
 
-设备 <code>{self.escape_html(device_id)}</code>
-来自 <code>{self.escape_html(sender)}</code>
-时间 <code>{self.escape_html(timestamp)}</code>
-
-{self.format_sms_content_block(content)}"""
-        
-        return message
+        # Keep the body between the short heading and metadata so HTML parsing
+        # does not strip whitespace belonging to the original SMS.
+        return (
+            "📩 <b>新短信</b>\n\n"
+            f"{body}\n\n"
+            f"设备 <code>{self.escape_html(device_display)}</code>\n"
+            f"来自 <code>{self.escape_html(sender)}</code>\n"
+            f"时间 <code>{self.escape_html(timestamp)}</code>"
+        )
     
     def format_help_message(self):
         """格式化帮助信息，使用丰富的HTML样式"""
@@ -431,7 +432,7 @@ class AsteriskBot:
         
         return text
     
-    async def send_message(self, chat_id: int, text: str, parse_mode: str = 'html', buttons=None):
+    async def send_message(self, chat_id: int, text: str, parse_mode: str = 'html', buttons=None, link_preview: bool = True):
         """发送消息到指定聊天"""
         try:
             if parse_mode:
@@ -439,13 +440,15 @@ class AsteriskBot:
                     entity=chat_id,
                     message=text,
                     parse_mode=parse_mode,
-                    buttons=buttons
+                    buttons=buttons,
+                    link_preview=link_preview
                 )
             else:
                 message = await self.client.send_message(
                     entity=chat_id,
                     message=text,
-                    buttons=buttons
+                    buttons=buttons,
+                    link_preview=link_preview
                 )
             return message
         except Exception as e:
@@ -458,7 +461,8 @@ class AsteriskBot:
                     entity=chat_id,
                     message=escaped_text,
                     parse_mode='html',
-                    buttons=buttons
+                    buttons=buttons,
+                    link_preview=link_preview
                 )
                 return message
             except Exception as e2:
@@ -468,7 +472,8 @@ class AsteriskBot:
                     message = await self.client.send_message(
                         entity=chat_id,
                         message=text,
-                        buttons=buttons
+                        buttons=buttons,
+                        link_preview=link_preview
                     )
                     return message
                 except Exception as e3:
@@ -626,7 +631,7 @@ class AsteriskBot:
                     ]
                     
                     # 尝试编辑消息恢复原始内容
-                    await self.send_message(chat_id, restored_message, buttons=restored_buttons)
+                    await self.send_message(chat_id, restored_message, buttons=restored_buttons, link_preview=False)
                     
                 except Exception as restore_error:
                     print(f"恢复原始消息时出错: {str(restore_error)}")
@@ -939,7 +944,7 @@ class AsteriskBot:
                         [Button.inline("💬 回复", f"reply_sms:{sms_id}")]
                     ]
                     
-                    await event.edit(restored_message, parse_mode='html', buttons=restored_buttons)
+                    await event.edit(restored_message, parse_mode='html', buttons=restored_buttons, link_preview=False)
                 else:
                     await event.edit("❌ 回复已取消", parse_mode='html', buttons=None)
                 
@@ -2992,6 +2997,15 @@ class AsteriskBot:
             
             # 生成唯一的SMS ID用于回复
             sms_id = f"sms_{int(time.time())}_{hash(content) % 10000}"
+
+            sms_info = {
+                'device': device_id,
+                'device_display': device_display,
+                'sender': sender_number,
+                'content': content,
+                'timestamp': timestamp,
+                'created_at': datetime.now()
+            }
             
             if is_silent:
                 # 使用增强的格式化方法构建Silent SMS报告
@@ -3002,15 +3016,7 @@ class AsteriskBot:
                 # Silent SMS 不需要回复按钮
                 buttons = None
             else:
-                # 优化普通短信显示格式，突出内容
-                message = f"""
-📩 <b>新短信</b>
-
-设备 <code>{self.escape_html(device_display)}</code>
-来自 <code>{self.escape_html(sender_number)}</code>
-时间 <code>{self.escape_html(timestamp)}</code>
-
-{self.format_sms_content_block(content)}"""
+                message = self.format_original_sms_message(sms_info)
                 
                 # 为普通短信添加回复按钮
                 buttons = [
@@ -3018,18 +3024,12 @@ class AsteriskBot:
                 ]
             
             # 保存SMS信息用于回复
-            self.pending_replies[sms_id] = {
-                'device': device_id,
-                'sender': sender_number,
-                'content': content,
-                'timestamp': timestamp,
-                'created_at': datetime.now()
-            }
+            self.pending_replies[sms_id] = sms_info
             
             # 向所有授权用户发送消息
             for user_id in Config.AUTHORIZED_USERS:
                 try:
-                    await self.send_message(user_id, message, buttons=buttons)
+                    await self.send_message(user_id, message, buttons=buttons, link_preview=is_silent)
                     if is_silent:
                         print(f"🔇 Silent SMS已推送给用户: {user_id}")
                     else:
@@ -3413,24 +3413,16 @@ class AsteriskBot:
 🚨 <b>安全警告</b>: 可能用于监控、定位或状态检查
                 """
             else:
-                notification_message = f"""
-📱 <b>收到新短信</b>
-
-📱 设备: <code>{device_name}</code>
-📞 发送方: <code>{sender}</code>
-⏰ 时间: <code>{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</code>
-
-💬 <b>短信内容</b>:
-━━━━━━━━━━━━━━━━━━
-{message}
-━━━━━━━━━━━━━━━━━━
-
-ℹ️ <i>检测到TP-PID但内容正常</i>
-                """
+                notification_message = self.format_original_sms_message({
+                    'device': device_name,
+                    'sender': sender,
+                    'content': message,
+                    'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                }) + "\n\nℹ️ <i>检测到TP-PID但内容正常</i>"
             
             for user_id in Config.AUTHORIZED_USERS:
                 try:
-                    await self.send_message(user_id, notification_message)
+                    await self.send_message(user_id, notification_message, link_preview=is_silent)
                     print(f"📱 SMS内容通知已推送给用户: {user_id}")
                 except Exception as e:
                     print(f"推送SMS内容通知给用户 {user_id} 失败: {str(e)}")
