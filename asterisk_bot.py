@@ -29,6 +29,20 @@ from config import Config
 
 
 class AsteriskBot:
+    COMMANDS = (
+        ('start', '开始使用'), ('help', '查看帮助'),
+        ('send_sms', '发送短信'), ('devices', '查看设备列表'),
+        ('device_settings', '查看设备设置'), ('device_state', '查看设备状态'),
+        ('device_statistics', '查看设备统计'), ('recover_numbers', '恢复设备本机号码'),
+        ('uac_recover', '检查与恢复 UAC 音频'), ('pending_sms', '查看待确认发送记录'),
+        ('sms_notifications', '设置短信发送通知'),
+        ('add_user', '添加授权用户'), ('remove_user', '移除授权用户'),
+        ('test_sms_log', '测试短信日志解析'), ('check_sms_logs', '查看近期短信日志'),
+    )
+    COMMAND_TIMEOUT_SECONDS = 15
+    COMMAND_CONCURRENCY = 2
+    PROCESS_STOP_SECONDS = 2
+
     def __init__(self):
         self.bot_token = Config.BOT_TOKEN
         self.sms_pipe_path = Config.SMS_PIPE_PATH
@@ -42,6 +56,7 @@ class AsteriskBot:
         self.pending_replies = {}  # 待回复的SMS
         self.running = False
         self.client = None
+        self.command_slots = asyncio.Semaphore(self.COMMAND_CONCURRENCY)
         self.processes = []  # 跟踪所有子进程
         self.sms_notifications = True  # SMS通知开关
         self.pending_sms_sends = {}  # 待确认的SMS发送请求
@@ -376,47 +391,26 @@ class AsteriskBot:
             f"时间 <code>{self.escape_html(timestamp)}</code>"
         )
     
+    def command_help_lines(self):
+        return "\n".join(
+            f"<code>/{name}</code> - {description}"
+            for name, description in self.COMMANDS
+        )
+
     def format_help_message(self):
-        """格式化帮助信息，使用丰富的HTML样式"""
-        help_text = f"""
-🤖 <b>Asterisk Telegram Bot 帮助</b>
+        return ("🤖 <b>Asterisk Telegram Bot 帮助</b>\n\n"
+                + self.command_help_lines()
+                + "\n\n收到短信后可使用回复按钮。管理和设备操作仍需授权。")
 
-<b>📱 SMS功能</b>
-<code>/send_sms</code> - 发送SMS（需要指定设备ID和手机号）
-<code>/reply_sms</code> - 回复SMS
-<code>/sms_notifications</code> - 管理SMS通知设置
+    async def sync_bot_commands(self):
+        """Keep default/private menus consistent without altering user authorization."""
+        from telethon import functions, types
+        commands = [types.BotCommand(name, description) for name, description in self.COMMANDS]
+        for scope in (types.BotCommandScopeDefault(), types.BotCommandScopeUsers()):
+            await asyncio.wait_for(self.client(functions.bots.SetBotCommandsRequest(
+                scope=scope, lang_code='', commands=commands)), timeout=10)
+        print("✅ Telegram默认和私聊命令菜单已同步")
 
-<b>📊 设备管理</b>
-<code>/devices</code> - 查看设备列表
-<code>/device_settings</code> - 查询设备设置
-<code>/device_state</code> - 查看设备状态
-<code>/device_statistics</code> - 查看设备统计
-<code>/recover_numbers</code> - 修复缺失的Quectel本机号码
-<code>/uac_recover</code> - 观测与恢复Quectel UAC音频通道
-
-<b>🔧 系统功能</b>
-<code>/help</code> - 显示此帮助信息
-<code>/test_sms_log</code> - 测试SMS日志解析
-<code>/check_sms_logs</code> - 检查最近SMS日志
-<code>/pending_sms</code> - 查看待确认SMS
-
-<b>👥 用户管理</b>
-<code>/add_user</code> - 添加授权用户
-<code>/remove_user</code> - 移除授权用户
-
-<b>💡 使用提示</b>
-• 使用内联按钮可以更方便地选择设备和操作
-• 所有时间显示格式为 <code>HH:MM:SS</code>
-• 设备状态会以 <i>斜体</i> 显示
-• 重要ID和号码会以 <code>代码</code> 格式显示
-
-<b>🔍 格式说明</b>
-<b>粗体文本</b> - 重要标题
-<i>斜体文本</i> - 状态信息
-<code>代码文本</code> - ID、号码、时间
-"""
-        return help_text
-    
     def test_message_formatting(self, text: str) -> str:
         """测试消息格式化（用于调试）"""
         print(f"原始文本: {repr(text)}")
@@ -433,53 +427,28 @@ class AsteriskBot:
         return text
     
     async def send_message(self, chat_id: int, text: str, parse_mode: str = 'html', buttons=None, link_preview: bool = True):
-        """发送消息到指定聊天"""
+        """Return a confirmed message or None; never retry uncertain network delivery."""
+        from telethon.errors import EntityBoundsInvalidError, EntitiesTooLongError
         try:
+            return await self.client.send_message(
+                entity=chat_id, message=text, parse_mode=parse_mode,
+                buttons=buttons, link_preview=link_preview)
+        except (EntityBoundsInvalidError, EntitiesTooLongError) as exc:
+            # These local/explicit entity rejections precede successful delivery.
+            # Only a formatting rejection can be retried with escaped text.
             if parse_mode:
-                message = await self.client.send_message(
-                    entity=chat_id,
-                    message=text,
-                    parse_mode=parse_mode,
-                    buttons=buttons,
-                    link_preview=link_preview
-                )
-            else:
-                message = await self.client.send_message(
-                    entity=chat_id,
-                    message=text,
-                    buttons=buttons,
-                    link_preview=link_preview
-                )
-            return message
-        except Exception as e:
-            print(f"❌ 发送消息时出错: {str(e)}")
-            # 如果格式化失败，尝试发送转义后的文本
-            try:
-                # 转义HTML特殊字符
-                escaped_text = self.escape_html(text)
-                message = await self.client.send_message(
-                    entity=chat_id,
-                    message=escaped_text,
-                    parse_mode='html',
-                    buttons=buttons,
-                    link_preview=link_preview
-                )
-                return message
-            except Exception as e2:
-                print(f"❌ 发送转义消息也失败: {str(e2)}")
-                # 最后尝试纯文本
                 try:
-                    message = await self.client.send_message(
-                        entity=chat_id,
-                        message=text,
-                        buttons=buttons,
-                        link_preview=link_preview
-                    )
-                    return message
-                except Exception as e3:
-                    print(f"❌ 发送纯文本消息也失败: {str(e3)}")
+                    return await self.client.send_message(
+                        entity=chat_id, message=self.escape_html(text), parse_mode='html',
+                        buttons=buttons, link_preview=link_preview)
+                except Exception as fallback_error:
+                    print(f"❌ Telegram投递未确认: {type(fallback_error).__name__}")
                     return None
-    
+            print(f"❌ Telegram投递未确认: {type(exc).__name__}")
+        except Exception as exc:
+            print(f"❌ Telegram投递未确认: {type(exc).__name__}；未自动重发")
+        return None
+
     async def setup_event_handlers(self):
         """设置Telethon事件处理器"""
         @self.client.on(events.NewMessage)
@@ -1047,26 +1016,11 @@ class AsteriskBot:
             await self.send_message(chat_id, welcome_msg)
             return
         
-        # 授权用户的欢迎信息
-        welcome_msg = """
-🤖 Asterisk Telegram Bot
-
-欢迎使用Asterisk Telegram Bot！
-
-可用命令：
-/send_sms - 发送短信
-/devices - 查询设备状态
-/device_settings - 查询设备设置
-/device_state - 查询设备状态
-/device_statistics - 查询设备统计
-/add_user - 添加授权用户（仅授权用户可用）
-/remove_user - 移除授权用户（仅授权用户可用）
-/help - 显示帮助信息
-
-💡 提示：收到SMS时会显示回复按钮，可以直接点击回复！
-        """
+        welcome_msg = ("🤖 <b>Asterisk Telegram Bot</b>\n\n欢迎使用！\n\n"
+                       + self.command_help_lines()
+                       + "\n\n收到短信后可点击回复按钮。")
         await self.send_message(chat_id, welcome_msg)
-    
+
     async def handle_help_command(self, chat_id: int, user_id: int):
         """处理/help命令"""
         # 检查用户权限
@@ -1520,8 +1474,13 @@ class AsteriskBot:
             else:
                 message += f"📊 总计: {pending_count} 个待确认请求"
             
+            unconfirmed = [info for info in self.pending_replies.values()
+                           if info.get('delivery_status', {}).get(user_id) == 'unconfirmed']
+            if unconfirmed:
+                message += f"\n\n⚠️ 当前有 {len(unconfirmed)} 条收到的短信未确认投递到本Telegram账号。"
+                message += "\n记录在内存中保留最多1小时，重启会清空；请核对原短信，未自动重发。"
             await self.send_message(chat_id, message)
-                
+
         except Exception as e:
             print(f"处理待确认SMS命令时出错: {str(e)}")
             await self.send_message(chat_id, f"❌ 处理命令时出错: {str(e)}")
@@ -1908,9 +1867,12 @@ class AsteriskBot:
                     notification_sent = False
                     for target_chat in dict.fromkeys(target_chats):
                         try:
-                            await self.send_message(target_chat, message)
-                            notification_sent = True
-                            print(f"📱 SMS通知已发送给 {target_chat}")
+                            sent = await self.send_message(target_chat, message)
+                            if sent is not None:
+                                notification_sent = True
+                                print(f"📱 SMS通知已发送给 {target_chat}")
+                            else:
+                                print("⚠️ SMS状态通知投递未确认")
                         except Exception as e:
                             print(f"❌ 发送SMS通知给 {target_chat} 失败: {str(e)}")
 
@@ -2040,62 +2002,111 @@ class AsteriskBot:
             print(f"❌ 查询设备时出错: {str(e)}")
             await self.send_message(chat_id, f"❌ 查询设备时出错：{str(e)}")
     
-    async def execute_command(self, command: str) -> str:
-        """执行系统命令"""
+    async def stop_command_process(self, process, communication):
+        """Terminate the process group, drain pipes, and reap before releasing its slot."""
+        if process.returncode is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(asyncio.shield(communication), self.PROCESS_STOP_SECONDS)
+            except asyncio.TimeoutError:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+        # Descendants may still own stdout after the leader exits.
+        if not communication.done():
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        await communication
+        await process.wait()
+
+    async def run_bounded_command(self, command, shell=False):
+        if not hasattr(self, 'command_slots'):
+            self.command_slots = asyncio.Semaphore(self.COMMAND_CONCURRENCY)
+        if not hasattr(self, 'processes'):
+            self.processes = []
         try:
-            process = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            stdout, stderr = await process.communicate()
-            
-            if process.returncode == 0:
-                return stdout.decode('utf-8')
-            else:
-                return stderr.decode('utf-8')
-                
-        except Exception as e:
-            return f"命令执行失败：{str(e)}"
+            await asyncio.wait_for(self.command_slots.acquire(), self.COMMAND_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            return "命令等待超时：未启动进程"
+        process = communication = None
+        try:
+            kwargs = dict(stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                          start_new_session=True)
+            spawn = asyncio.create_task(
+                asyncio.create_subprocess_shell(command, **kwargs) if shell
+                else asyncio.create_subprocess_exec(*command, **kwargs))
+            try:
+                process = await asyncio.shield(spawn)
+            except asyncio.CancelledError:
+                # Spawn may already have created a child; take ownership before
+                # propagating cancellation so finally can reap it.
+                process = await spawn
+                self.processes.append(process)
+                communication = asyncio.create_task(process.communicate())
+                raise
+            self.processes.append(process)
+            communication = asyncio.create_task(process.communicate())
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    asyncio.shield(communication), self.COMMAND_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                return "命令执行超时：结果未确认，未自动重试"
+            output = stdout.decode('utf-8', errors='replace')
+            error = stderr.decode('utf-8', errors='replace')
+            return output if process.returncode == 0 else error or output
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return f"命令执行失败：{type(exc).__name__}"
+        finally:
+            try:
+                if process is not None and communication is not None:
+                    cleanup = asyncio.create_task(self.stop_command_process(process, communication))
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        await cleanup
+                        raise
+            finally:
+                if process in self.processes:
+                    self.processes.remove(process)
+                self.command_slots.release()
+
+    async def execute_command(self, command: str) -> str:
+        return await self.run_bounded_command(command, shell=True)
 
     async def execute_asterisk_cli(self, cli_command: str) -> str:
-        """执行Asterisk CLI命令，避免经过shell展开AT命令或短信内容。"""
         try:
             prefix_args = shlex.split(Config.ASTERISK_COMMAND_PREFIX)
-            if not prefix_args:
-                return "命令执行失败：ASTERISK_COMMAND_PREFIX 未配置"
-
-            process = await asyncio.create_subprocess_exec(
-                *prefix_args,
-                cli_command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-
-            stdout, stderr = await process.communicate()
-            output = stdout.decode('utf-8', errors='ignore')
-            error = stderr.decode('utf-8', errors='ignore')
-
-            if process.returncode == 0:
-                return output
-            return error or output
-
-        except Exception as e:
-            return f"命令执行失败：{str(e)}"
+        except ValueError:
+            return "命令执行失败：ASTERISK_COMMAND_PREFIX 格式错误"
+        if not prefix_args:
+            return "命令执行失败：ASTERISK_COMMAND_PREFIX 未配置"
+        return await self.run_bounded_command([*prefix_args, cli_command])
 
     @staticmethod
     def parse_uac_health(state_output: str) -> bool:
-        """A recovery is healthy only when the module, voice and registration are all ready and idle."""
-        normalized = state_output.lower()
-        checks = (
-            re.search(r'current device state:\s*start\b', normalized),
-            re.search(r'desired device state:\s*start\b', normalized),
-            re.search(r'voice:\s*yes\b', normalized),
-            re.search(r'(gsm|network|registration).*?(registered|home|roaming)', normalized),
-            re.search(r'calls/channels:\s*0\b', normalized),
-        )
-        return all(checks)
+        fields = {}
+        for line in state_output.splitlines():
+            if ':' not in line:
+                continue
+            key, value = line.split(':', 1)
+            key, value = key.strip().lower(), value.strip().lower()
+            if key in fields:
+                return False
+            fields[key] = value
+        registration = fields.get('gsm registration status', fields.get('gsm registration', ''))
+        return (fields.get('current device state') == 'start'
+                and fields.get('desired device state') == 'start'
+                and fields.get('voice') == 'yes'
+                and fields.get('calls/channels') == '0'
+                and registration in ('registered', 'registered, home network', 'registered, roaming'))
 
     async def recover_uac(self, device_id: str, source: str, hard_reset: bool = False) -> dict:
         """Perform exactly one explicit recovery; no path here escalates from soft to hard."""
@@ -3004,7 +3015,8 @@ class AsteriskBot:
                 'sender': sender_number,
                 'content': content,
                 'timestamp': timestamp,
-                'created_at': datetime.now()
+                'created_at': datetime.now(),
+                'delivery_status': {}
             }
             
             if is_silent:
@@ -3029,13 +3041,18 @@ class AsteriskBot:
             # 向所有授权用户发送消息
             for user_id in Config.AUTHORIZED_USERS:
                 try:
-                    await self.send_message(user_id, message, buttons=buttons, link_preview=is_silent)
+                    sent = await self.send_message(user_id, message, buttons=buttons, link_preview=is_silent)
+                    sms_info['delivery_status'][user_id] = 'confirmed' if sent is not None else 'unconfirmed'
+                    if sent is None:
+                        print("❌ 短信Telegram投递未确认；保留待确认记录，未自动重发")
+                        continue
                     if is_silent:
                         print(f"🔇 Silent SMS已推送给用户: {user_id}")
                     else:
                         print(f"📤 短信已推送给用户: {user_id}")
                 except Exception as e:
-                    print(f"推送短信给用户 {user_id} 失败: {str(e)}")
+                    sms_info['delivery_status'][user_id] = 'unconfirmed'
+                    print(f"❌ 短信Telegram投递未确认: {type(e).__name__}")
                     
         except Exception as e:
             print(f"推送短信时出错: {str(e)}")
@@ -3422,8 +3439,11 @@ class AsteriskBot:
             
             for user_id in Config.AUTHORIZED_USERS:
                 try:
-                    await self.send_message(user_id, notification_message, link_preview=is_silent)
-                    print(f"📱 SMS内容通知已推送给用户: {user_id}")
+                    sent = await self.send_message(user_id, notification_message, link_preview=is_silent)
+                    if sent is not None:
+                        print(f"📱 SMS内容通知已推送给用户: {user_id}")
+                    else:
+                        print("❌ SMS内容通知投递未确认；未自动重发")
                 except Exception as e:
                     print(f"推送SMS内容通知给用户 {user_id} 失败: {str(e)}")
                     
@@ -3533,6 +3553,10 @@ class AsteriskBot:
                 print("🔌 正在连接Telegram客户端...")
                 await self.client.start(bot_token=self.bot_token)
                 print("✅ Telethon客户端已连接")
+                try:
+                    await self.sync_bot_commands()
+                except Exception as menu_error:
+                    print(f"⚠️ 命令菜单同步失败: {type(menu_error).__name__}；下次连接重试")
                 return True
 
             except Exception as e:
@@ -3557,11 +3581,12 @@ class AsteriskBot:
             if not connected:
                 break
 
+            disconnected = self.client.disconnected
             try:
                 while self.running:
                     try:
                         await asyncio.wait_for(
-                            asyncio.shield(self.client.disconnected),
+                            asyncio.shield(disconnected),
                             timeout=1.0
                         )
                         break
@@ -3575,6 +3600,14 @@ class AsteriskBot:
                 raise
             except Exception as e:
                 print(f"❌ Telegram客户端运行时出错: {str(e)}")
+
+            finally:
+                if not disconnected.done():
+                    disconnected.cancel()
+                try:
+                    await disconnected
+                except (asyncio.CancelledError, Exception):
+                    pass
 
             if self.running:
                 try:

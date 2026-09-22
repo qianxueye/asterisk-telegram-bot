@@ -255,11 +255,11 @@ class SmsFlowTests(SmsAssertions, unittest.IsolatedAsyncioTestCase):
 
     async def test_send_wrapper_preserves_preview_default_and_each_fallback(self):
         for parse_mode in ('html', None):
-            for failure_count in range(3):
+            for failure_count in range(2) if parse_mode else range(1):
                 with self.subTest(parse_mode=parse_mode, failure_count=failure_count):
                     result = object()
                     client_send = AsyncMock(side_effect=[
-                        *[RuntimeError('offline formatting failure') for _ in range(failure_count)],
+                        *[__import__('telethon').errors.EntityBoundsInvalidError(request=None) for _ in range(failure_count)],
                         result,
                     ])
                     self.bot.client.send_message = client_send
