@@ -260,3 +260,29 @@ astctlpermissions = 0777
 
 通过 socket 权限配置，我们在不降低安全性的情况下解决了权限问题。
 
+
+## Asterisk 本身的原生监督（现有 Raspberry Pi 部署）
+
+`systemd/asterisk.service` 用于替代本项目现场的 SysV 生成单元。它运行
+`/usr/sbin/asterisk -f`，因此 systemd 跟踪真正的 PBX 主进程；异常退出后
+5秒重试，5分钟内最多3次启动，避免崩溃重启风暴。`systemctl stop` 不会自动拉起。
+
+此模板保留已核验现场的root运行身份、默认Asterisk配置和524288文件描述符上限，
+不替换Asterisk二进制或模块。不应直接用于原本有自定义 `AST_USER`、`ASTARGS`、
+`ALTCONF` 等启动参数的主机；先将实际参数迁移到本机override。
+
+部署前备份现有单元、脚本、启用状态和运行参数，验证没有第二个PBX进程。
+在确认没有活跃通话后，先执行 `core stop gracefully` 等待原进程退出，
+再安装原生单元、`daemon-reload`、启动和启用。不要只依赖旧SysV的stop返回码，
+旧单元的MainPID=0可能无法证明daemon已停止。首次启动需确认MainPID与实际
+Asterisk PID一致、双卡注册、SIP注册、短信Bot及其FIFO仍正常。
+
+回滚时停止新单元并确认进程消失，恢复原单元/启用状态和watchdog脚本，
+再启动旧服务并验证。不要通过杀死生产Asterisk来测试自动拉起；可以在隔离的
+systemd测试单元验证重启策略，生产回读验证MainPID与Restart属性。
+
+网络watchdog现在先刷新PJSIP；成功时不重启PBX。失败时再次核对网络、注册
+和精确的通话计数，未知/错误结果不视为零。必要时请求 `core restart gracefully`，
+让Asterisk停止接收新呼叫并等待已有呼叫结束；请求日志不等于已完成重启。
+CLI调用有10秒期限（`WATCHDOG_CLI_TIMEOUT_SECONDS`）和2秒终止宽限，
+失败不自动升级为强制重启。该策略不能检测所有daemon挂死，也不等于端到端通话检测。

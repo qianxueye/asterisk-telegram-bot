@@ -1,0 +1,25 @@
+# Native replacement for the generated SysV unit on the audited Raspberry Pi.
+# Keep the existing Asterisk configuration, binary, root identity and module ABI.
+[Unit]
+Description=Asterisk PBX
+After=network-online.target nss-lookup.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/asterisk -f
+ExecReload=/usr/sbin/asterisk -rx "module reload"
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillMode=mixed
+RuntimeDirectory=asterisk
+RuntimeDirectoryMode=0755
+LimitNOFILE=524288
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -u
+set -uo pipefail
 
 TARGET_HOST="${WATCHDOG_TARGET_HOST:-10.9.40.45}"
 TARGET_IF="${WATCHDOG_TARGET_IF:-ztjczphv5x}"
@@ -15,6 +15,7 @@ RESTART_AFTER_FLAP="${WATCHDOG_RESTART_ASTERISK_AFTER_FLAP:-true}"
 RESTART_DEFER_ATTEMPTS="${WATCHDOG_RESTART_DEFER_ATTEMPTS:-40}"
 RESTART_DEFER_SECONDS="${WATCHDOG_RESTART_DEFER_SECONDS:-15}"
 LOG_TAG="${WATCHDOG_LOG_TAG:-asterisk-network-watchdog}"
+CLI_TIMEOUT="${WATCHDOG_CLI_TIMEOUT_SECONDS:-10}"
 
 log() {
   logger -t "$LOG_TAG" "$*"
@@ -22,7 +23,7 @@ log() {
 }
 
 asterisk_cli() {
-  sudo -n "$ASTERISK_BIN" -rx "$1" 2>&1
+  timeout --signal=TERM --kill-after=2s "${CLI_TIMEOUT}s" sudo -n "$ASTERISK_BIN" -rx "$1" 2>&1
 }
 
 ping_ok() {
@@ -30,15 +31,26 @@ ping_ok() {
 }
 
 active_channels() {
-  asterisk_cli "core show channels count" | awk '/active channels/ {print $1; exit}'
+  local output
+  output="$(asterisk_cli "core show channels count")" || return 1
+  # Missing/error/duplicate output is unknown, never an idle count.
+  printf '%s\n' "$output" | awk '
+    /^[[:space:]]*[0-9]+ active channels[[:space:]]*$/ { count++; value=$1 }
+    END { if (count == 1) print value; else exit 1 }'
 }
 
 registration_ok() {
-  asterisk_cli "pjsip show registrations" | grep -Eq "${REGISTRATION}/.*Registered"
+  asterisk_cli "pjsip show registrations" | awk -v target="$REGISTRATION/" '
+    { for (j=1; j<=NF; j++) if (index($j, target) == 1)
+        for (i=j+1; i<=NF; i++) if ($i == "Registered") ok=1 }
+    END { exit !ok }'
 }
 
 contact_ok() {
-  asterisk_cli "pjsip show contacts" | grep -Eq "${QUALIFY_ENDPOINT}/.*Avail"
+  asterisk_cli "pjsip show contacts" | awk -v target="$QUALIFY_ENDPOINT/" '
+    { for (j=1; j<=NF; j++) if (index($j, target) == 1)
+        for (i=j+1; i<=NF; i++) if ($i == "Avail") ok=1 }
+    END { exit !ok }'
 }
 
 recover_pjsip() {
@@ -60,13 +72,30 @@ restart_asterisk_when_idle() {
   local attempt channels
 
   for attempt in $(seq 1 "$RESTART_DEFER_ATTEMPTS"); do
-    channels="$(active_channels || true)"
-    channels="${channels:-0}"
+    if ! ping_ok; then
+      log "Skipped Asterisk restart: network is unavailable again"
+      return 1
+    fi
+    if registration_ok && contact_ok; then
+      log "Skipped Asterisk restart: PJSIP recovered while waiting"
+      return 0
+    fi
+    if ! channels="$(active_channels)"; then
+      log "Skipped Asterisk restart: active channel count is unknown"
+      return 1
+    fi
 
     if [ "$channels" = "0" ]; then
-      log "Restarting Asterisk after confirmed network flap; no active channels"
-      asterisk_cli "core restart now" | while IFS= read -r line; do log "asterisk restart: ${line}"; done
-      return 0
+      # A new call can arrive after the count query. Let Asterisk drain it
+      # rather than using an immediate restart that can cut off that call.
+      local response
+      if response="$(asterisk_cli "core restart gracefully")" &&
+          ! printf '%s\n' "$response" | grep -Eqi 'No more connections|Unable to connect|No such command|failed'; then
+        log "Requested graceful Asterisk restart after unsuccessful PJSIP refresh"
+        return 0
+      fi
+      log "Asterisk restart request was not confirmed; no forced restart attempted"
+      return 1
     fi
 
     log "Deferring Asterisk restart after network flap; active channels=${channels}, attempt=${attempt}/${RESTART_DEFER_ATTEMPTS}"
@@ -75,6 +104,19 @@ restart_asterisk_when_idle() {
 
   log "Skipped Asterisk restart because active calls did not drain"
   return 1
+}
+
+recover_after_flap() {
+  if recover_pjsip; then
+    log "Network recovery complete; keeping Asterisk running"
+    return 0
+  fi
+  if [ "$RESTART_AFTER_FLAP" = "true" ]; then
+    restart_asterisk_when_idle
+  else
+    log "PJSIP remains unhealthy; automatic restart is disabled"
+    return 1
+  fi
 }
 
 main() {
@@ -111,11 +153,7 @@ main() {
 
       if [ $((now - last_recovery)) -ge "$RECOVERY_COOLDOWN" ]; then
         last_recovery="$now"
-        recover_pjsip || true
-
-        if [ "$RESTART_AFTER_FLAP" = "true" ]; then
-          restart_asterisk_when_idle || true
-        fi
+        recover_after_flap || true
       else
         log "Skipping recovery because cooldown is active"
       fi
@@ -127,4 +165,6 @@ main() {
   done
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
