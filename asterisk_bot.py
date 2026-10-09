@@ -26,6 +26,7 @@ from telethon.tl.functions.messages import SendMessageRequest
 from telethon.tl.types import UpdateNewMessage, Message
 from telethon.tl.custom import Button
 from config import Config
+from sms_guard import SmsFloodGuard, DEVICE
 
 
 class AsteriskBot:
@@ -35,7 +36,7 @@ class AsteriskBot:
         ('device_settings', '查看设备设置'), ('device_state', '查看设备状态'),
         ('device_statistics', '查看设备统计'), ('recover_numbers', '恢复设备本机号码'),
         ('uac_recover', '检查与恢复 UAC 音频'), ('pending_sms', '查看待确认发送记录'),
-        ('sms_notifications', '设置短信发送通知'),
+        ('sms_notifications', '设置短信发送通知'), ('sms_guard', '短信防护'),
         ('add_user', '添加授权用户'), ('remove_user', '移除授权用户'),
         ('test_sms_log', '测试短信日志解析'), ('check_sms_logs', '查看近期短信日志'),
     )
@@ -65,6 +66,9 @@ class AsteriskBot:
         self.uac_device_locks = defaultdict(asyncio.Lock)
         self.uac_error_events = defaultdict(list)
         self.uac_recovery_state = self.load_uac_recovery_state()
+        self.sms_guard = SmsFloodGuard(os.getenv('SMS_GUARD_STATE_FILE', os.path.join(os.path.dirname(os.path.abspath(__file__)), '.sms_guard_state.json')))
+        self.sms_outbox = asyncio.Queue(maxsize=64)
+        self.sms_queue_dropped = 0
         self.background_tasks = []
         self.event_handlers_ready = False
         self.setup_sms_pipe()
@@ -151,9 +155,9 @@ class AsteriskBot:
                 os.unlink(self.sms_pipe_path)
 
             if not os.path.exists(self.sms_pipe_path):
-                os.mkfifo(self.sms_pipe_path, 0o666)
+                os.mkfifo(self.sms_pipe_path, 0o600)
                 print(f"📡 创建SMS管道: {self.sms_pipe_path}")
-            os.chmod(self.sms_pipe_path, 0o666)
+            os.chmod(self.sms_pipe_path, 0o600)
         except Exception as e:
             print(f"创建SMS管道失败: {str(e)}")
     
@@ -460,7 +464,7 @@ class AsteriskBot:
                 user_id = message.sender_id
                 text = message.text
                 
-                print(f"💬 收到消息: {text} (来自用户: {user_id})")
+                print("💬 收到Telegram消息")
                 
                 # 检查用户权限
                 if not Config.is_authorized(user_id):
@@ -468,7 +472,9 @@ class AsteriskBot:
                     return
                 
                 # 检查用户状态
-                if user_id in self.user_states:
+                if text and text.split()[0].split('@')[0] == '/sms_guard':
+                    await self.handle_sms_guard_command(chat_id, text, user_id)
+                elif user_id in self.user_states:
                     await self.handle_user_state_message(chat_id, user_id, text)
                 else:
                     # 处理命令
@@ -501,6 +507,8 @@ class AsteriskBot:
                 await self.handle_start_command(chat_id, user_id)
             elif text.startswith('/help'):
                 await self.handle_help_command(chat_id, user_id)
+            elif text and text.split()[0].split('@')[0] == '/sms_guard':
+                await self.handle_sms_guard_command(chat_id, text, user_id)
             elif text.startswith('/send_sms'):
                 await self.handle_send_sms_command(chat_id, text)
             elif text.startswith('/devices'):
@@ -2951,48 +2959,110 @@ class AsteriskBot:
             print(f"验证Silent SMS时出错: {str(e)}")
             return False, f"验证错误: {str(e)}", {}
     
-    async def process_sms_data(self, data: str):
-        """处理SMS数据"""
+    def queue_sms_item(self, item):
         try:
-            sms_info = json.loads(data)
-            
-            device_id = sms_info.get('device_id', 'unknown')
-            sender_number = sms_info.get('sender_number', 'unknown')
-            content = sms_info.get('content', '')
-            content_base64 = sms_info.get('content_base64', '')
-            if content_base64:
-                try:
-                    content = base64.b64decode(content_base64).decode('utf-8', errors='replace')
-                except Exception as e:
-                    print(f"⚠️ 解码SMS base64内容失败: {str(e)}")
-                    content = sms_info.get('content', '')
-            timestamp = sms_info.get('timestamp', '')
-            
-            print(f"📨 收到新短信: {device_id} <- {sender_number}: {content}")
-            
-            # 添加到日志缓存
-            self.add_to_log_cache({
-                'type': 'sms_received',
-                'device': device_id,
-                'sender': sender_number,
-                'content': content,
-                'timestamp_str': timestamp
-            })
-            
-            # 智能检测Silent SMS
-            context = {'timestamp': timestamp}
-            is_silent, reason, analysis = await self.verify_silent_sms(device_id, sender_number, content, timestamp, context)
-            
-            print(f"🔍 Silent SMS检测结果: {is_silent} - {reason}")
-            
-            # 向所有授权用户推送短信
-            await self.push_sms_to_users(device_id, sender_number, content, timestamp, is_silent, reason, analysis)
-            
-        except json.JSONDecodeError:
-            print(f"解析SMS数据失败: {data}")
-        except Exception as e:
-            print(f"处理SMS数据出错: {str(e)}")
-    
+            self.sms_outbox.put_nowait(item)
+        except asyncio.QueueFull:
+            self.sms_queue_dropped += 1
+
+    def queue_guard_notice(self, device, transition):
+        kind, dropped = transition
+        self.queue_sms_item({'notice': kind, 'device_id': device, 'dropped': dropped})
+
+    async def handle_sms_guard_command(self, chat_id, text, user_id):
+        if not Config.is_authorized(user_id):
+            return
+        parts = text.split()
+        if len(parts) > 3 or (len(parts) == 3 and not DEVICE.fullmatch(parts[2])):
+            await self.send_message(chat_id, '/sms_guard auto|manual|off [quectel0]')
+            return
+        action = parts[1] if len(parts) >= 2 else 'status'
+        if action != 'status':
+            try:
+                self.sms_guard.set_mode(action, parts[2] if len(parts) == 3 else None)
+            except (OSError, ValueError):
+                await self.send_message(chat_id, '设置失败。/sms_guard auto|manual|off [quectel0]')
+                return
+        labels = {'auto': '自动', 'manual': '手动拦截', 'off': '关闭'}
+        lines = ['短信防护', '默认：' + labels[self.sms_guard.state['default_mode']],
+                 '自动阈值：一分钟15条或五分钟30条验证码',
+                 '/sms_guard auto [quectel0]', '/sms_guard manual [quectel0]',
+                 '/sms_guard off [quectel0]']
+        for record in self.sms_guard.state['devices'].values():
+            mode = labels[record['mode']]
+            if record['active']:
+                mode += '（拦截中）'
+            lines.append(f"{record['device']}：{mode}，丢弃 {record['dropped']} 条")
+        if self.sms_guard.storage_failed:
+            lines.append('状态保存异常，验证码暂时丢弃')
+        lines.append(f'发送队列满时丢弃：{self.sms_queue_dropped} 条')
+        await self.send_message(chat_id, '\n'.join(lines), parse_mode=None)
+
+    async def process_sms_data(self, data: str):
+        try:
+            info = json.loads(data)
+            if not isinstance(info, dict):
+                raise ValueError('SMS envelope type')
+            device = info['device_id']
+            sender = info.get('sender_number', '')
+            content = info.get('content', '')
+            if info.get('content_base64'):
+                content = base64.b64decode(info['content_base64'], validate=True).decode('utf-8')
+            timestamp = info.get('timestamp', '')
+            event_id = info.get('event_id')
+            sim_id = info.get('sim_id', '')
+            if not all(isinstance(value, str) for value in (device, sender, content, timestamp, sim_id)):
+                raise ValueError('SMS field type')
+            if len(content.encode('utf-8')) > 131072 or not DEVICE.fullmatch(device):
+                raise ValueError('SMS field bounds')
+            if not isinstance(event_id, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', event_id):
+                raise ValueError('SMS event identity missing')
+            outcome, transition = self.sms_guard.admit(device, content, device + ':' + event_id, sim_id)
+            if transition:
+                self.queue_guard_notice(device, transition)
+            if outcome != 'allow':
+                return
+            self.queue_sms_item({'device_id': device, 'sender_number': sender,
+                                 'content': content, 'timestamp': timestamp})
+        except (ValueError, TypeError, KeyError, UnicodeError) as exc:
+            print('短信输入已丢弃：' + type(exc).__name__)
+
+    async def deliver_sms_item(self, info):
+        if 'notice' in info:
+            device = info['device_id']
+            message = (f"{device} 短信防护已开启，后续验证码正文丢弃" if info['notice'] == 'start'
+                       else f"{device} 短信防护已解除，丢弃 {info['dropped']} 条验证码")
+            for user in Config.AUTHORIZED_USERS:
+                await self.send_message(user, message, parse_mode=None)
+            return
+        device, sender = info['device_id'], info['sender_number']
+        content, timestamp = info['content'], info['timestamp']
+        self.add_to_log_cache({'type': 'sms_received', 'device': device,
+                               'sender': sender, 'timestamp_str': timestamp})
+        is_silent, reason, analysis = await self.verify_silent_sms(
+            device, sender, content, timestamp, {'timestamp': timestamp})
+        await self.push_sms_to_users(device, sender, content, timestamp, is_silent, reason, analysis)
+
+    async def sms_delivery_worker(self):
+        while self.running:
+            item = await self.sms_outbox.get()
+            try:
+                await asyncio.wait_for(self.deliver_sms_item(item), timeout=30)
+            except Exception as exc:
+                print('短信投递未确认：' + type(exc).__name__ + '；未自动重发')
+            finally:
+                self.sms_outbox.task_done()
+                del item
+
+    async def sms_guard_watchdog(self):
+        while self.running:
+            await asyncio.sleep(5)
+            try:
+                for device, dropped in self.sms_guard.recover():
+                    self.queue_guard_notice(device, ('end', dropped))
+            except OSError:
+                self.sms_guard.storage_failed = True
+
     async def push_sms_to_users(self, device_id: str, sender_number: str, content: str, timestamp: str, is_silent: bool = False, reason: str = "", analysis: dict = None):
         """向授权用户推送短信"""
         try:
@@ -3007,7 +3077,7 @@ class AsteriskBot:
             device_display = f"{device_id} {device_phone}" if device_phone else device_id
             
             # 生成唯一的SMS ID用于回复
-            sms_id = f"sms_{int(time.time())}_{hash(content) % 10000}"
+            sms_id = 'sms_' + secrets.token_hex(12)
 
             sms_info = {
                 'device': device_id,
@@ -3036,6 +3106,8 @@ class AsteriskBot:
                 ]
             
             # 保存SMS信息用于回复
+            if len(self.pending_replies) >= 256:
+                del self.pending_replies[next(iter(self.pending_replies))]
             self.pending_replies[sms_id] = sms_info
             
             # 向所有授权用户发送消息
@@ -3080,8 +3152,12 @@ class AsteriskBot:
                                 continue
 
                             buffer += chunk
+                            if len(buffer) > 524288 and b'\n' not in buffer:
+                                buffer = b''
                             while b'\n' in buffer:
                                 raw_line, buffer = buffer.split(b'\n', 1)
+                                if len(raw_line) > 262144:
+                                    continue
                                 line = raw_line.decode('utf-8', errors='replace').strip()
                                 if line:
                                     await self.process_sms_data(line)
@@ -3134,15 +3210,6 @@ class AsteriskBot:
                 re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\].*?\[(\w+)\].*?Silent SMS.*?TP-PID (0x[0-9a-fA-F]+)')
             ]
             
-            sms_patterns = [
-                # 标准 SMS 接收模式
-                re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\].*?\[(\w+)\]\[SMS:(\d+).*?\] Got message from ([\+\d]+): \[(.*?)\]'),
-                # 变体模式1：不同的格式
-                re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\].*?\[(\w+)\].*?SMS.*?from ([\+\d]+): \[(.*?)\]'),
-                # 变体模式2：可能的其他格式
-                re.compile(r'\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\].*?\[(\w+)\].*?Message from ([\+\d]+): (.*)')
-            ]
-            
             line_count = 0
             last_log_check = time.time()
             
@@ -3187,24 +3254,6 @@ class AsteriskBot:
                                 break  # 找到匹配后跳出循环
                             except (IndexError, AttributeError) as e:
                                 print(f"⚠️ Silent SMS模式匹配错误: {str(e)}")
-                                continue
-                    
-                    # 检测 SMS 接收
-                    for pattern in sms_patterns:
-                        sms_match = pattern.search(line_str)
-                        if sms_match:
-                            try:
-                                if len(sms_match.groups()) >= 4:
-                                    sms_timestamp = sms_match.group(1)
-                                    device_name = sms_match.group(2)
-                                    sms_id = sms_match.group(3) if len(sms_match.groups()) >= 5 else 'unknown'
-                                    sender = sms_match.group(4) if len(sms_match.groups()) >= 5 else sms_match.group(3)
-                                    message = sms_match.group(5) if len(sms_match.groups()) >= 5 else sms_match.group(4)
-                                    
-                                    await self.handle_sms_received(device_name, sms_id, sender, message, sms_timestamp)
-                                    break  # 找到匹配后跳出循环
-                            except (IndexError, AttributeError) as e:
-                                print(f"⚠️ SMS模式匹配错误: {str(e)}")
                                 continue
                     
                     # 定期检查日志文件是否仍然存在
@@ -3311,49 +3360,9 @@ class AsteriskBot:
         await self.send_silent_sms_notification(device_name, tp_pid, log_timestamp, log_line)
     
     async def handle_sms_received(self, device_name, sms_id, sender, message, sms_timestamp):
-        """处理 SMS 接收"""
-        # 添加到日志缓存
-        self.add_to_log_cache({
-            'type': 'sms_received',
-            'device': device_name,
-            'sender': sender,
-            'content': message,
-            'sms_id': sms_id,
-            'timestamp_str': sms_timestamp
-        })
-        
-        # 查找匹配的Silent SMS记录
-        silent_record = self.find_matching_silent_sms(device_name, sms_timestamp)
-        
-        if silent_record:
-            print(f"📱 [SILENT SMS CONTENT] Device: {device_name}, From: {sender}, Message: '{message}'")
-            
-            # 使用智能检测验证
-            context = {
-                'tp_pid': silent_record['tp_pid'],
-                'silent_notice': True
-            }
-            is_silent, reason, analysis = await self.verify_silent_sms(device_name, sender, message, sms_timestamp, context)
-            
-            await self.send_silent_sms_content_notification(device_name, sender, message, silent_record['tp_pid'], is_silent, reason, analysis)
-            
-            if device_name in self.silent_sms_queue:
-                self.silent_sms_queue[device_name].remove(silent_record)
-        else:
-            # 没有匹配的Silent SMS记录，但可能是独立的Silent SMS
-            print(f"📱 [REGULAR SMS] Device: {device_name}, From: {sender}, Message: '{message}'")
-            
-            # 进行智能检测
-            context = {'timestamp': sms_timestamp}
-            is_silent, reason, analysis = await self.verify_silent_sms(device_name, sender, message, sms_timestamp, context)
-            
-            if is_silent:
-                print(f"🔍 独立Silent SMS检测: {reason}")
-                await self.send_silent_sms_content_notification(device_name, sender, message, None, is_silent, reason, analysis)
-            else:
-                # 普通短信，直接推送
-                await self.push_sms_to_users(device_name, sender, message, sms_timestamp, is_silent, reason, analysis)
-    
+        # Receive logs cannot carry the producer's stable event identity.
+        return
+
     def find_matching_silent_sms(self, device_name, sms_timestamp):
         """查找匹配的 Silent SMS 记录"""
         if device_name not in self.silent_sms_queue:
@@ -3646,6 +3655,8 @@ class AsteriskBot:
                 await asyncio.sleep(Config.ASTERISK_STARTUP_DELAY_SECONDS)
             
             # 4. 启动SMS管道监听任务
+            self.create_background_task(self.sms_delivery_worker())
+            self.create_background_task(self.sms_guard_watchdog())
             self.create_background_task(self.listen_sms_pipe())
             print("✅ SMS管道监听已启动")
             
