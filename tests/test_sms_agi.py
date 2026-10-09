@@ -75,6 +75,14 @@ class AgiTests(unittest.TestCase):
                 forward(pipe, {'content': 'body'}, timeout=.05)
             self.assertLess(time.monotonic()-start, .5)
             fd = os.open(pipe, os.O_RDONLY | os.O_NONBLOCK)
+            filler = os.open(pipe, os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                while True:
+                    os.write(filler, b'x'*4096)
+            except BlockingIOError:
+                pass
+            finally:
+                os.close(filler)
             with self.assertRaises(TimeoutError):
                 forward(pipe, {'content': 'x'*200000}, timeout=.05)
             os.close(fd)
