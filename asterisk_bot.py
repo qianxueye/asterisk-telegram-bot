@@ -18,6 +18,7 @@ import shlex
 import base64
 import stat
 import secrets
+import unicodedata
 from datetime import datetime, timedelta
 from collections import defaultdict
 from typing import Dict, List, Optional
@@ -510,7 +511,7 @@ class AsteriskBot:
             elif text and text.split()[0].split('@')[0] == '/sms_guard':
                 await self.handle_sms_guard_command(chat_id, text, user_id)
             elif text.startswith('/send_sms'):
-                await self.handle_send_sms_command(chat_id, text)
+                await self.handle_send_sms_command(chat_id, text, user_id)
             elif text.startswith('/devices'):
                 await self.handle_devices_command(chat_id)
             elif text.startswith('/device_settings'):
@@ -548,6 +549,9 @@ class AsteriskBot:
             if not user_state:
                 await self.handle_message_command(chat_id, user_id, text)
                 return
+            if user_state.get('chat_id') is not None and user_state['chat_id'] != chat_id:
+                await self.send_message(chat_id, "请回到开始发送短信的聊天中继续，短信草稿已保留。")
+                return
             
             action = user_state.get('action')
             
@@ -555,8 +559,10 @@ class AsteriskBot:
                 await self.handle_reply_sms_content(chat_id, user_id, text, user_state)
             elif action == 'send_sms':
                 await self.handle_send_sms_content(chat_id, user_id, text, user_state)
-            elif action == 'send_sms_phone':
+            elif action in ('send_sms_phone', 'send_sms_confirm'):
                 await self.handle_send_sms_phone(chat_id, user_id, text, user_state)
+            elif action == 'send_sms_preview':
+                await self.send_message(chat_id, "正在准备发送预览，请稍候。")
             else:
                 # 未知状态，清除并处理为普通命令
                 del self.user_states[user_id]
@@ -629,21 +635,26 @@ class AsteriskBot:
         try:
             device_id = user_state.get('device_id')
             flow_id = user_state.get('flow_id') or self.create_flow_id()
+            if not content or not content.strip():
+                await self.send_message(chat_id, "请输入短信正文，内容不能为空。",
+                                        buttons=[[self.cancel_button(flow_id)]])
+                return
             
             # 保存SMS内容到用户状态，等待用户输入手机号
             self.user_states[user_id] = {
                 'action': 'send_sms_phone',
                 'device_id': device_id,
                 'sms_content': content,
-                'flow_id': flow_id
+                'flow_id': flow_id,
+                'chat_id': chat_id,
             }
             
             # 询问用户输入手机号
             await self.send_message(
                 chat_id,
-                f"📝 <b>短信内容</b>\n\n"
-                f"{self.format_sms_content_block(content)}\n\n"
-                f"📱 请输入接收手机号（例如 <code>+8613800138000</code>）：",
+                f"📝 短信内容已保存。\n\n"
+                f"📱 请输入接收手机号，例如 <code>13800138000</code>。\n"
+                f"不写国际区号时默认 +86；其他地区请加 +国家区号。",
                 buttons=[[self.cancel_button(flow_id)]]
             )
             
@@ -657,25 +668,90 @@ class AsteriskBot:
             device_id = user_state.get('device_id')
             sms_content = user_state.get('sms_content')
             
-            # 验证手机号格式
-            if not self.validate_phone_number(phone_number):
+            try:
+                phone_number = self.normalize_sms_recipient(phone_number)
+            except ValueError as error:
                 flow_id = user_state.get('flow_id')
                 await self.send_message(
                     chat_id,
-                    "❌ 手机号格式不正确，请重新输入（例如 <code>+8613800138000</code>）：",
+                    f"❌ {self.escape_html(str(error))}\n请重新输入号码，短信内容已保留。",
                     buttons=[[self.cancel_button(flow_id)]]
                 )
                 return
             
-            # 清除用户状态
-            del self.user_states[user_id]
-            
-            # 发送SMS（非静默模式，显示设备信息）
-            await self.send_sms(chat_id, device_id, phone_number, sms_content, silent=False)
+            await self.show_sms_send_confirmation(chat_id, user_id, device_id, phone_number, sms_content)
             
         except Exception as e:
             print(f"处理发送SMS手机号时出错: {str(e)}")
             await self.send_message(chat_id, f"❌ 处理手机号时出错: {str(e)}")
+
+    async def show_sms_send_confirmation(self, chat_id, user_id, device_id, phone_number, content):
+        flow_id = self.create_flow_id()
+        state = {
+            'action': 'send_sms_preview', 'chat_id': chat_id, 'device_id': device_id,
+            'phone_number': phone_number, 'sms_content': content, 'flow_id': flow_id,
+        }
+        self.user_states[user_id] = state
+        header = (f"📱 <b>确认发送短信</b>\n\n"
+                  f"设备 <code>{self.escape_html(device_id)}</code>\n"
+                  f"接收方 <code>{self.escape_html(phone_number)}</code>\n\n")
+        instruction = "请核对完整号码和内容，点击确认后才会发送。"
+        message = header + self.format_sms_content_block(content) + '\n\n' + instruction
+        preview_ok = True
+        if len(message.encode('utf-16-le')) > 7000:
+            for offset in range(0, len(content), 1500):
+                if self.user_states.get(user_id) is not state:
+                    return
+                delivered = await self.send_message(chat_id, content[offset:offset+1500],
+                                                    parse_mode=None, link_preview=False)
+                if delivered is None:
+                    preview_ok = False
+                    break
+            message = header + "正文已在上方分段展示。\n" + instruction
+        if self.user_states.get(user_id) is not state:
+            return
+        if preview_ok:
+            delivered = await self.send_message(
+                chat_id, message,
+                buttons=[[Button.inline("确认发送", f"sms_send:confirm:{flow_id}"),
+                          Button.inline("修改号码", f"sms_send:edit:{flow_id}")],
+                         [self.cancel_button(flow_id)]], link_preview=False)
+            preview_ok = delivered is not None
+        if self.user_states.get(user_id) is not state:
+            return
+        state['action'] = 'send_sms_confirm' if preview_ok else 'send_sms_phone'
+        if not preview_ok:
+            await self.send_message(chat_id, "预览未完整送达，请重新输入号码后再确认。短信草稿已保留。",
+                                    buttons=[[self.cancel_button(flow_id)]])
+
+    async def handle_sms_send_confirmation(self, event, operation, flow_id, user_id, chat_id):
+        state = self.user_states.get(user_id, {})
+        if (not Config.is_authorized(user_id) or state.get('action') != 'send_sms_confirm'
+                or state.get('flow_id') != flow_id or state.get('chat_id') != chat_id):
+            await event.answer("此发送确认已失效，请重新输入号码。")
+            return
+        if operation == 'edit':
+            state['action'] = 'send_sms_phone'
+            state['flow_id'] = self.create_flow_id()
+            await event.answer()
+            await event.edit("请输入新的接收手机号；短信内容已保留。省略国际区号时默认 +86。",
+                             buttons=[[self.cancel_button(state['flow_id'])]])
+        elif operation == 'confirm':
+            del self.user_states[user_id]
+            try:
+                await event.answer()
+                await event.edit("📤 正在提交短信。", buttons=None)
+            except Exception as error:
+                print(f"发送确认界面更新失败: {type(error).__name__}")
+            success = await self.send_sms(chat_id, state['device_id'], state['phone_number'],
+                                          state['sms_content'], silent=False)
+            try:
+                await event.edit("📤 已提交，请查看后续发送结果。" if success else
+                                 "⚠️ 未能确认提交，请先核对发送结果，避免重复发送。", buttons=None)
+            except Exception as error:
+                print(f"发送结果界面更新失败: {type(error).__name__}")
+        else:
+            await event.answer("未知操作。")
     
     async def handle_callback_action(self, event, data: str, user_id: int, chat_id: int):
         """处理回调查询动作"""
@@ -703,6 +779,9 @@ class AsteriskBot:
                 # 发送SMS选择设备
                 device_id = parts[1] if len(parts) > 1 else None
                 await self.handle_send_sms_device_callback(event, device_id, user_id, chat_id)
+
+            elif action == 'sms_send' and len(parts) == 3:
+                await self.handle_sms_send_confirmation(event, parts[1], parts[2], user_id, chat_id)
                 
             elif action == 'device_settings':
                 # 设备设置选择
@@ -815,7 +894,8 @@ class AsteriskBot:
                 self.user_states[user_id] = {
                     'action': 'send_sms',
                     'device_id': device_id,
-                    'flow_id': flow_id
+                    'flow_id': flow_id,
+                    'chat_id': chat_id,
                 }
                 
                 # 获取设备信息
@@ -1040,9 +1120,9 @@ class AsteriskBot:
         help_msg = self.format_help_message()
         await self.send_message(chat_id, help_msg)
     
-    async def handle_send_sms_command(self, chat_id: int, text: str):
+    async def handle_send_sms_command(self, chat_id: int, text: str, user_id: int):
         """处理/send_sms命令"""
-        parts = text.split(' ', 3)
+        parts = text.split(maxsplit=3)
         
         if len(parts) < 4:
             # 显示设备选择界面
@@ -1053,11 +1133,20 @@ class AsteriskBot:
         phone_number = parts[2]
         sms_content = parts[3]
         
-        if not self.validate_phone_number(phone_number):
-            await self.send_message(chat_id, "❌ 手机号格式不正确")
+        try:
+            phone_number = self.normalize_sms_recipient(phone_number)
+        except ValueError as error:
+            flow_id = self.create_flow_id()
+            self.user_states[user_id] = {
+                'action': 'send_sms_phone', 'device_id': device_id, 'sms_content': sms_content,
+                'flow_id': flow_id, 'chat_id': chat_id,
+            }
+            await self.send_message(chat_id,
+                                    f"❌ {self.escape_html(str(error))}\n请重新输入号码，短信内容已保留。",
+                                    buttons=[[self.cancel_button(flow_id)]])
             return
         
-        await self.send_sms(chat_id, device_id, phone_number, sms_content, silent=False)
+        await self.show_sms_send_confirmation(chat_id, user_id, device_id, phone_number, sms_content)
     
     async def show_send_sms_device_selection(self, chat_id: int):
         """显示发送SMS设备选择界面"""
@@ -1493,10 +1582,27 @@ class AsteriskBot:
             print(f"处理待确认SMS命令时出错: {str(e)}")
             await self.send_message(chat_id, f"❌ 处理命令时出错: {str(e)}")
     
-    def validate_phone_number(self, phone_number: str) -> bool:
-        """验证手机号格式"""
-        pattern = r'^\+?[1-9]\d{1,14}$'
-        return bool(re.match(pattern, phone_number))
+    def normalize_sms_recipient(self, value):
+        if not isinstance(value, str) or not value.strip() or len(value) > 80:
+            raise ValueError("请输入接收手机号。")
+        value = unicodedata.normalize('NFKC', value).strip()
+        if not re.fullmatch(r'[+0-9 -]+', value):
+            raise ValueError("号码只能包含数字、开头的 +、空格或连字符。")
+        value = value.replace(' ', '').replace('-', '')
+        if value.startswith('00'):
+            value = '+' + value[2:]
+        elif not value.startswith('+'):
+            if re.fullmatch(r'861[3-9][0-9]{9}', value):
+                value = '+' + value
+            elif re.fullmatch(r'1[3-9][0-9]{9}', value):
+                value = '+86' + value
+            else:
+                raise ValueError("未写国际区号时，请输入11位大陆手机号；其他地区请加 +国家区号。")
+        if not re.fullmatch(r'\+[1-9][0-9]{6,14}', value):
+            raise ValueError("国际号码格式不正确，请核对国家区号和号码长度。")
+        if value.startswith('+86') and not re.fullmatch(r'\+861[3-9][0-9]{9}', value):
+            raise ValueError("请检查大陆手机号的位数和号段，并确认没有重复填写86区号。")
+        return value
 
     def parse_tp_pid(self, tp_pid) -> Optional[int]:
         """解析TP-PID值，支持0x40和十进制字符串。"""
@@ -1905,6 +2011,10 @@ class AsteriskBot:
     async def send_sms(self, chat_id: int, device_id: str, phone_number: str, content: str, silent: bool = True):
         """使用指定设备发送短信"""
         try:
+            if not isinstance(phone_number, str) or not re.fullmatch(r'\+?[0-9]{1,32}', phone_number):
+                if not silent:
+                    await self.send_message(chat_id, "❌ 接收号码格式不正确，未提交短信。")
+                return False
             devices = await self.get_device_list()
             device_found = False
             device_phone = None
