@@ -145,6 +145,55 @@ class RecipientFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(1, self.bot.user_states)
         self.assertIn('未能确认提交', self.event.edit.await_args.args[0])
 
+    async def test_recipient_edits_cannot_move_a_private_draft_to_another_chat(self):
+        token = await self.prepare()
+        state = self.bot.user_states[1]
+        self.bot.send_message.reset_mock()
+        await self.bot.handle_user_state_message(11, 1, '13900139000')
+        self.assertIs(self.bot.user_states[1], state)
+        self.assertEqual(state['chat_id'], 10)
+        self.assertEqual(state['flow_id'], token)
+        message = self.bot.send_message.await_args.args[1]
+        self.assertNotIn('synthetic', message)
+        self.assertNotIn('+8613800138000', message)
+        self.bot.send_sms.assert_not_awaited()
+
+    async def test_long_unicode_preview_is_bounded_complete_and_confirmed(self):
+        body = ('😀<>&' * 900) + '尾部'
+        await self.bot.show_sms_send_confirmation(10, 1, 'quectel1', '+8613800138000', body)
+        calls = self.bot.send_message.await_args_list
+        chunks = calls[:-1]
+        self.assertEqual(''.join(call.args[1] for call in chunks), body)
+        for call in chunks:
+            self.assertLessEqual(len(call.args[1].encode('utf-16-le')), 6000)
+            self.assertIsNone(call.kwargs['parse_mode'])
+            self.assertNotIn('buttons', call.kwargs)
+        self.assertIn('buttons', calls[-1].kwargs)
+        self.assertEqual(self.bot.user_states[1]['action'], 'send_sms_confirm')
+        self.assertEqual(self.bot.user_states[1]['sms_content'], body)
+        self.bot.send_sms.assert_not_awaited()
+
+    async def test_long_menu_content_keeps_the_number_prompt_bounded(self):
+        body = '😀<>&' * 900
+        state = {'action': 'send_sms', 'device_id': 'quectel1', 'flow_id': 'old', 'chat_id': 10}
+        self.bot.user_states[1] = state
+        await self.bot.handle_send_sms_content(10, 1, body, state)
+        self.assertLess(len(self.bot.send_message.await_args.args[1]), 500)
+        self.assertEqual(self.bot.user_states[1]['sms_content'], body)
+        self.assertEqual(self.bot.user_states[1]['chat_id'], 10)
+        self.bot.send_sms.assert_not_awaited()
+
+    async def test_partial_or_uncertain_preview_never_enables_submission(self):
+        for body, results in [('x'*4000, [True, None, True]), ('short', [None, True])]:
+            with self.subTest(length=len(body)):
+                self.bot.send_message = AsyncMock(side_effect=results)
+                await self.bot.show_sms_send_confirmation(10, 1, 'quectel1', '+8613800138000', body)
+                state = self.bot.user_states[1]
+                self.assertEqual(state['action'], 'send_sms_phone')
+                self.assertEqual(state['sms_content'], body)
+                await self.bot.handle_callback_action(self.event, 'sms_send:confirm:'+state['flow_id'], 1, 10)
+                self.bot.send_sms.assert_not_awaited()
+
     async def test_empty_content_is_not_accepted(self):
         state = {'action': 'send_sms', 'device_id': 'quectel1', 'flow_id': 'old'}
         self.bot.user_states[1] = state

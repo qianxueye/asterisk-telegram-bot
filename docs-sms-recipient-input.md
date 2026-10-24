@@ -6,6 +6,8 @@ Mainland mobile inputs must match `1[3-9][0-9]{9}` after removing the country co
 
 The Bot displays the complete normalized destination, device and escaped message body. Only the confirmation button submits. Editing the number retains the body and replaces the flow token; invalid input retains the draft. Cancelled, replaced, foreign-user, foreign-chat and consumed confirmation buttons cannot submit the draft. The token is consumed before any awaited submission work, so repeated taps do not resubmit. Empty message input remains in the content-entry step. An unconfirmed submission is never automatically retried.
 
+Drafts remain bound to their originating chat during recipient entry and edits. Oversized previews show the complete body in plain-text chunks of at most 1,500 Unicode code points (at most 3,000 UTF-16 units), then show destination metadata and controls. Every body chunk and the control message must have confirmed Telegram delivery before the draft can be submitted. Partial or uncertain preview delivery keeps the draft in number-entry state without enabling submission.
+
 Replies use the original sender address, including service short codes, without adding `+86`. The shared send boundary rejects nonnumeric/control-bearing destinations before invoking the CLI. It does not rewrite reply addresses.
 
 ## Reviewed interface copy
@@ -15,6 +17,7 @@ Activation scope: the updated Bot process after deployment/restart. Existing Tel
 | Screen/key | Before | After | Reason |
 | --- | --- | --- | --- |
 | Content entry / empty body | Advanced to number entry | 请输入短信正文，内容不能为空。 | Retain the draft step without submitting an empty SMS. |
+| Content entry / saved | Repeated the entire body before the number prompt | 短信内容已保存。 | Keep the recipient prompt bounded; show the complete body during confirmation. |
 | Recipient prompt | 请输入接收手机号（例如 +8613800138000） | 请输入接收手机号，例如 13800138000。不写国际区号时默认 +86；其他地区请加 +国家区号。 | State the default and the explicit international form. |
 | Recipient / empty or excessive input | 手机号格式不正确 | 请输入接收手机号。 | Ask for a bounded recipient input. |
 | Recipient / invalid characters | 手机号格式不正确 | 号码只能包含数字、开头的 +、空格或连字符。 | Explain accepted input without echoing invalid text. |
@@ -31,5 +34,9 @@ Activation scope: the updated Bot process after deployment/restart. Existing Tel
 | Confirmation / uncertain | Existing error message only | 未能确认提交，请先核对发送结果，避免重复发送。 | Avoid implying that a retry is safe. |
 | Confirmation / unknown action | Generic unknown-operation message | 未知操作。 | Reject unrecognized callbacks. |
 | Send boundary / invalid destination | CLI error after submission attempt | 接收号码格式不正确，未提交短信。 | Reject malformed addresses before the CLI. |
+| Draft / another chat | Could continue a private draft in another chat | 请回到开始发送短信的聊天中继续，短信草稿已保留。 | Keep the body in its originating chat. |
+| Preview / preparing | No preparing state | 正在准备发送预览，请稍候。 | Keep input from replacing an in-flight preview. |
+| Preview / long body | Oversized combined confirmation | 正文已在上方分段展示。 | Show bounded complete body chunks before controls. |
+| Preview / uncertain delivery | Pending confirmation without a delivered control | 预览未完整送达，请重新输入号码后再确认。短信草稿已保留。 | Retain the draft without enabling submission. |
 
 Source checks and mock submissions do not replace the Owner's real SMS acceptance. Agent validation must not send SMS.

@@ -549,6 +549,9 @@ class AsteriskBot:
             if not user_state:
                 await self.handle_message_command(chat_id, user_id, text)
                 return
+            if user_state.get('chat_id') is not None and user_state['chat_id'] != chat_id:
+                await self.send_message(chat_id, "请回到开始发送短信的聊天中继续，短信草稿已保留。")
+                return
             
             action = user_state.get('action')
             
@@ -558,6 +561,8 @@ class AsteriskBot:
                 await self.handle_send_sms_content(chat_id, user_id, text, user_state)
             elif action in ('send_sms_phone', 'send_sms_confirm'):
                 await self.handle_send_sms_phone(chat_id, user_id, text, user_state)
+            elif action == 'send_sms_preview':
+                await self.send_message(chat_id, "正在准备发送预览，请稍候。")
             else:
                 # 未知状态，清除并处理为普通命令
                 del self.user_states[user_id]
@@ -640,14 +645,14 @@ class AsteriskBot:
                 'action': 'send_sms_phone',
                 'device_id': device_id,
                 'sms_content': content,
-                'flow_id': flow_id
+                'flow_id': flow_id,
+                'chat_id': chat_id,
             }
             
             # 询问用户输入手机号
             await self.send_message(
                 chat_id,
-                f"📝 <b>短信内容</b>\n\n"
-                f"{self.format_sms_content_block(content)}\n\n"
+                f"📝 短信内容已保存。\n\n"
                 f"📱 请输入接收手机号，例如 <code>13800138000</code>。\n"
                 f"不写国际区号时默认 +86；其他地区请加 +国家区号。",
                 buttons=[[self.cancel_button(flow_id)]]
@@ -682,22 +687,42 @@ class AsteriskBot:
 
     async def show_sms_send_confirmation(self, chat_id, user_id, device_id, phone_number, content):
         flow_id = self.create_flow_id()
-        self.user_states[user_id] = {
-            'action': 'send_sms_confirm', 'chat_id': chat_id, 'device_id': device_id,
+        state = {
+            'action': 'send_sms_preview', 'chat_id': chat_id, 'device_id': device_id,
             'phone_number': phone_number, 'sms_content': content, 'flow_id': flow_id,
         }
-        await self.send_message(
-            chat_id,
-            f"📱 <b>确认发送短信</b>\n\n"
-            f"设备 <code>{self.escape_html(device_id)}</code>\n"
-            f"接收方 <code>{self.escape_html(phone_number)}</code>\n\n"
-            f"{self.format_sms_content_block(content)}\n\n"
-            f"请核对完整号码和内容，点击确认后才会发送。",
-            buttons=[[Button.inline("确认发送", f"sms_send:confirm:{flow_id}"),
-                      Button.inline("修改号码", f"sms_send:edit:{flow_id}")],
-                     [self.cancel_button(flow_id)]],
-            link_preview=False,
-        )
+        self.user_states[user_id] = state
+        header = (f"📱 <b>确认发送短信</b>\n\n"
+                  f"设备 <code>{self.escape_html(device_id)}</code>\n"
+                  f"接收方 <code>{self.escape_html(phone_number)}</code>\n\n")
+        instruction = "请核对完整号码和内容，点击确认后才会发送。"
+        message = header + self.format_sms_content_block(content) + '\n\n' + instruction
+        preview_ok = True
+        if len(message.encode('utf-16-le')) > 7000:
+            for offset in range(0, len(content), 1500):
+                if self.user_states.get(user_id) is not state:
+                    return
+                delivered = await self.send_message(chat_id, content[offset:offset+1500],
+                                                    parse_mode=None, link_preview=False)
+                if delivered is None:
+                    preview_ok = False
+                    break
+            message = header + "正文已在上方分段展示。\n" + instruction
+        if self.user_states.get(user_id) is not state:
+            return
+        if preview_ok:
+            delivered = await self.send_message(
+                chat_id, message,
+                buttons=[[Button.inline("确认发送", f"sms_send:confirm:{flow_id}"),
+                          Button.inline("修改号码", f"sms_send:edit:{flow_id}")],
+                         [self.cancel_button(flow_id)]], link_preview=False)
+            preview_ok = delivered is not None
+        if self.user_states.get(user_id) is not state:
+            return
+        state['action'] = 'send_sms_confirm' if preview_ok else 'send_sms_phone'
+        if not preview_ok:
+            await self.send_message(chat_id, "预览未完整送达，请重新输入号码后再确认。短信草稿已保留。",
+                                    buttons=[[self.cancel_button(flow_id)]])
 
     async def handle_sms_send_confirmation(self, event, operation, flow_id, user_id, chat_id):
         state = self.user_states.get(user_id, {})
@@ -863,7 +888,8 @@ class AsteriskBot:
                 self.user_states[user_id] = {
                     'action': 'send_sms',
                     'device_id': device_id,
-                    'flow_id': flow_id
+                    'flow_id': flow_id,
+                    'chat_id': chat_id,
                 }
                 
                 # 获取设备信息
@@ -1107,7 +1133,7 @@ class AsteriskBot:
             flow_id = self.create_flow_id()
             self.user_states[user_id] = {
                 'action': 'send_sms_phone', 'device_id': device_id, 'sms_content': sms_content,
-                'flow_id': flow_id,
+                'flow_id': flow_id, 'chat_id': chat_id,
             }
             await self.send_message(chat_id,
                                     f"❌ {self.escape_html(str(error))}\n请重新输入号码，短信内容已保留。",
