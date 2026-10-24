@@ -1737,7 +1737,10 @@ class AsteriskBot:
                 message_type = "unknown"
                 is_success = False
                 
-                if "successfully sent message" in log_line.lower():
+                if re.search(r'successfully sent message part\s+\d+/\d+', log_line, re.IGNORECASE):
+                    message_type = "sending_progress"
+                    is_success = False
+                elif "successfully sent message" in log_line.lower():
                     message_type = "send_success"
                     is_success = True
                 elif "sending message in progress" in log_line.lower():

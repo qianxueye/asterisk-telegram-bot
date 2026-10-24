@@ -4,6 +4,7 @@ import contextlib
 from datetime import datetime
 import io
 from pathlib import Path
+import re
 import time
 from types import SimpleNamespace
 from typing import Optional
@@ -16,10 +17,10 @@ def receipt_class():
     tree = ast.parse(path.read_text())
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'AsteriskBot')
     names = {'handle_sms_send_result', 'find_pending_sms_send', 'format_sms_send_result_message',
-             'cleanup_pending_sms_sends', 'escape_html', 'preview_text'}
+             'cleanup_pending_sms_sends', 'escape_html', 'preview_text', 'parse_sms_send_result'}
     cls.body = [node for node in cls.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                 and node.name in names]
-    namespace = {'asyncio': asyncio, 'datetime': datetime, 'time': time, 'Optional': Optional,
+    namespace = {'asyncio': asyncio, 'datetime': datetime, 'time': time, 'Optional': Optional, 're': re,
                  'Config': SimpleNamespace(AUTHORIZED_USERS={1})}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[])),
                  str(path), 'exec'), namespace)
@@ -99,6 +100,31 @@ class ModuleReceiptTests(unittest.IsolatedAsyncioTestCase):
         await self.apply(bot, self.result('send_error'))
         self.assertEqual(bot.pending_sms_sends['request']['status'], 'completed')
         self.assertIn('短信发送失败', bot.send_message.await_args.args[1])
+
+    async def test_multipart_progress_never_completes_the_next_queued_send(self):
+        bot = self.bot()
+        bot.pending_sms_sends['second'] = dict(bot.pending_sms_sends['request'],
+                                               timestamp=time.time()+1, content='second')
+        for part in (1, 2):
+            result = bot.parse_sms_send_result(
+                f'[quectel1][SMS:101 REF:{part}] Successfully sent message part {part}/3')
+            self.assertEqual(result['message_type'], 'sending_progress')
+            self.assertFalse(result['success'])
+            await self.apply(bot, result)
+        self.assertTrue(all(info['status'] == 'queued' for info in bot.pending_sms_sends.values()))
+        bot.send_message.assert_not_awaited()
+        await self.apply(bot, bot.parse_sms_send_result(
+            '[quectel1][SMS:101] Successfully sent message [3 parts]'))
+        self.assertEqual(bot.pending_sms_sends['request']['status'], 'completed')
+        self.assertEqual(bot.pending_sms_sends['second']['status'], 'queued')
+        await self.apply(bot, bot.parse_sms_send_result(
+            '[quectel1][SMS:101 REF:2] Successfully sent message part 2/3'))
+        self.assertEqual(bot.pending_sms_sends['second']['status'], 'queued')
+        self.assertEqual(bot.send_message.await_count, 1)
+        await self.apply(bot, bot.parse_sms_send_result(
+            '[quectel1][SMS:102 REF:4] Successfully sent message'))
+        self.assertEqual(bot.pending_sms_sends['second']['status'], 'completed')
+        self.assertEqual(bot.send_message.await_count, 2)
 
 
 if __name__ == '__main__':

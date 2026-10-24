@@ -6,6 +6,8 @@ Carrier status reports do not complete the Bot's send workflow and are not pushe
 
 The log listener starts at the end of the file. Restarting the Bot does not replay historical submission results as new receipts.
 
+Multipart part-progress messages never complete a request. The plugin emits one final submission result after the message's parts finish. Requests retain the existing FIFO association by device and optional recipient; the current CLI queue acknowledgement does not expose the plugin's database message ID. No carrier reference or database ID is treated as a persistent identity across Asterisk restarts.
+
 Only requests still waiting for a modem result (`queued`) can receive the existing timeout warning: more than 600 seconds, checked every 300 seconds. A modem-confirmed send becomes `completed` before Telegram notification delivery, even when notifications are muted or delivery is uncertain. Completed records are removed after 60 seconds under the existing cleanup schedule. A missing carrier report never triggers a later warning or resend. This change does not reconstruct old reports or add persistent SMS storage.
 
 ## Reviewed notification copy
