@@ -4,6 +4,8 @@ The queue acknowledgement only confirms that Asterisk accepted a request. The mo
 
 Carrier status reports do not complete the Bot's send workflow and are not pushed as additional send results. The plugin can still process and acknowledge them; this Bot-only change does not reconfigure the modem or remove plugin report handling. Unrelated acknowledgement errors do not complete a queued outgoing send.
 
+The log listener starts at the end of the file. Restarting the Bot does not replay historical submission results as new receipts.
+
 Only requests still waiting for a modem result (`queued`) can receive the existing timeout warning: more than 600 seconds, checked every 300 seconds. A modem-confirmed send becomes `completed` before Telegram notification delivery, even when notifications are muted or delivery is uncertain. Completed records are removed after 60 seconds under the existing cleanup schedule. A missing carrier report never triggers a later warning or resend. This change does not reconstruct old reports or add persistent SMS storage.
 
 ## Reviewed notification copy

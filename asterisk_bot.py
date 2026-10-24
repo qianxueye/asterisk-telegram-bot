@@ -3304,7 +3304,7 @@ class AsteriskBot:
             
             # 创建tail进程
             process = await asyncio.create_subprocess_exec(
-                'tail', '-F', self.log_file,
+                'tail', '-n', '0', '-F', self.log_file,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE
             )
