@@ -3517,12 +3517,19 @@ class AsteriskBot:
                     age = current_time - send_info.get('timestamp', current_time)
                     completed_age = current_time - send_info.get('last_result_at', send_info.get('timestamp', current_time))
                     if status in ('queued', 'sent') and age > 600:
+                        if status == 'sent':
+                            title = "ℹ️ <b>短信已发出，未收到送达报告</b>"
+                            detail = "模块已确认发出，是否送达尚未确认；这不代表发送失败。"
+                        else:
+                            title = "⚠️ <b>短信发送尚未确认</b>"
+                            detail = "尚未收到模块发送结果，发送状态未知。"
                         await self.send_message(
                             send_info['chat_id'],
-                            f"⚠️ <b>短信发送未收到最终回执</b>\n\n"
+                            f"{title}\n\n"
                             f"设备 <code>{self.escape_html(send_info['device_id'])}</code>\n"
                             f"接收方 <code>{self.escape_html(send_info['phone_number'])}</code>\n"
-                            f"等待 <code>{int(age)}秒</code>\n\n"
+                            f"等待 <code>{int(age)}秒</code>\n"
+                            f"{detail}\n\n"
                             f"内容 <code>{self.escape_html(self.preview_text(send_info.get('content', '')))}</code>"
                         )
                         expired_sends.append(send_id)
