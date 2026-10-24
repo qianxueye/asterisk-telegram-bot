@@ -1700,7 +1700,7 @@ class AsteriskBot:
         for send_id, send_info in self.pending_sms_sends.items():
             if send_info.get('device_id') != device:
                 continue
-            if send_info.get('status') not in ('queued', 'sent'):
+            if send_info.get('status') != 'queued':
                 continue
             if now - send_info.get('timestamp', 0) > 900:
                 continue
@@ -1724,7 +1724,7 @@ class AsteriskBot:
         phone_number = sms_result.get('phone_number') or (send_info or {}).get('phone_number')
 
         title_map = {
-            'send_success': ('✅', '短信发送成功'),
+            'send_success': ('✅', '模块已确认发出'),
             'send_error': ('❌', '短信发送失败'),
             'ack_error': ('⚠️', '短信确认失败'),
             'status_report': ('📊' if success else '⚠️', '短信状态报告'),
@@ -1751,6 +1751,7 @@ class AsteriskBot:
             lines.append(f"状态 <code>{'成功' if success else '失败'}</code>")
         elif message_type == 'send_success':
             lines.append("状态 <code>模块已确认发出</code>")
+            lines.append("此回执不代表对方已收到。")
         elif message_type in ('send_error', 'ack_error'):
             lines.append("状态 <code>失败</code>")
 
@@ -1773,6 +1774,8 @@ class AsteriskBot:
             status_code = sms_result.get('status_code')
             message_type = sms_result['message_type']
             success = sms_result['success']
+            if message_type in ('status_report', 'report_success'):
+                return
             
             # 根据消息类型构建不同的消息
             message = ""
@@ -1856,13 +1859,18 @@ class AsteriskBot:
             if status_code:
                 log_msg += f" STATUS:{status_code}"
             print(log_msg)
+
+            matched_send = (self.find_pending_sms_send(device, phone_number)
+                            if message_type in ('send_success', 'send_error') else None)
+            send_info = self.pending_sms_sends.get(matched_send) if matched_send else None
+            if send_info:
+                send_info['status'] = 'completed'
+                send_info['last_result_at'] = time.time()
             
             # 根据通知设置决定是否发送通知
             if self.sms_notifications:
-                important_types = ["send_success", "send_error", "ack_error", "status_report", "report_success"]
+                important_types = ["send_success", "send_error", "ack_error"]
                 if message_type in important_types:
-                    matched_send = self.find_pending_sms_send(device, phone_number)
-                    send_info = self.pending_sms_sends.get(matched_send) if matched_send else None
                     target_chats = []
 
                     if send_info:
@@ -1883,14 +1891,6 @@ class AsteriskBot:
                                 print("⚠️ SMS状态通知投递未确认")
                         except Exception as e:
                             print(f"❌ 发送SMS通知给 {target_chat} 失败: {str(e)}")
-
-                    if matched_send:
-                        if message_type == "send_success":
-                            self.pending_sms_sends[matched_send]['status'] = 'sent'
-                        else:
-                            self.pending_sms_sends[matched_send]['status'] = 'completed'
-                        self.pending_sms_sends[matched_send]['last_result_at'] = time.time()
-                        print(f"📱 更新发送请求状态: {matched_send} -> {self.pending_sms_sends[matched_send]['status']}")
 
                     if not notification_sent:
                         print("⚠️ SMS通知发送失败，没有成功发送给任何用户")
@@ -3516,20 +3516,14 @@ class AsteriskBot:
                     status = send_info.get('status')
                     age = current_time - send_info.get('timestamp', current_time)
                     completed_age = current_time - send_info.get('last_result_at', send_info.get('timestamp', current_time))
-                    if status in ('queued', 'sent') and age > 600:
-                        if status == 'sent':
-                            title = "ℹ️ <b>短信已发出，未收到送达报告</b>"
-                            detail = "模块已确认发出，是否送达尚未确认；这不代表发送失败。"
-                        else:
-                            title = "⚠️ <b>短信发送尚未确认</b>"
-                            detail = "尚未收到模块发送结果，发送状态未知。"
+                    if status == 'queued' and age > 600:
                         await self.send_message(
                             send_info['chat_id'],
-                            f"{title}\n\n"
+                            f"⚠️ <b>短信发送尚未确认</b>\n\n"
                             f"设备 <code>{self.escape_html(send_info['device_id'])}</code>\n"
                             f"接收方 <code>{self.escape_html(send_info['phone_number'])}</code>\n"
                             f"等待 <code>{int(age)}秒</code>\n"
-                            f"{detail}\n\n"
+                            f"尚未收到模块发送结果，发送状态未知。\n\n"
                             f"内容 <code>{self.escape_html(self.preview_text(send_info.get('content', '')))}</code>"
                         )
                         expired_sends.append(send_id)

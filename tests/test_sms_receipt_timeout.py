@@ -22,8 +22,7 @@ class ReceiptTimeoutTests(unittest.IsolatedAsyncioTestCase):
         now = time.time()
         for status, age, title, detail, removed in [
             ('queued', 700, '短信发送尚未确认', '尚未收到模块发送结果，发送状态未知。', True),
-            ('sent', 700, '短信已发出，未收到送达报告', '模块已确认发出', True),
-            ('sent', 200, None, None, False),
+            ('queued', 200, None, None, False),
             ('completed', 700, None, None, True),
         ]:
             with self.subTest(status=status, age=age):
@@ -47,9 +46,6 @@ class ReceiptTimeoutTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn(title, message)
                     self.assertIn(detail, message)
                     self.assertIn('&lt;synthetic&gt;', message)
-                    if status == 'sent':
-                        self.assertIn('这不代表发送失败', message)
-                        self.assertNotIn('发送状态未知', message)
                 else:
                     bot.send_message.assert_not_awaited()
 
