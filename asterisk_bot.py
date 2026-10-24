@@ -738,12 +738,18 @@ class AsteriskBot:
                              buttons=[[self.cancel_button(state['flow_id'])]])
         elif operation == 'confirm':
             del self.user_states[user_id]
-            await event.answer()
-            await event.edit("📤 正在提交短信。", buttons=None)
+            try:
+                await event.answer()
+                await event.edit("📤 正在提交短信。", buttons=None)
+            except Exception as error:
+                print(f"发送确认界面更新失败: {type(error).__name__}")
             success = await self.send_sms(chat_id, state['device_id'], state['phone_number'],
                                           state['sms_content'], silent=False)
-            await event.edit("📤 已提交，请查看后续发送结果。" if success else
-                             "⚠️ 未能确认提交，请先核对发送结果，避免重复发送。", buttons=None)
+            try:
+                await event.edit("📤 已提交，请查看后续发送结果。" if success else
+                                 "⚠️ 未能确认提交，请先核对发送结果，避免重复发送。", buttons=None)
+            except Exception as error:
+                print(f"发送结果界面更新失败: {type(error).__name__}")
         else:
             await event.answer("未知操作。")
     

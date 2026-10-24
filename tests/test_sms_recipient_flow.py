@@ -194,6 +194,23 @@ class RecipientFlowTests(unittest.IsolatedAsyncioTestCase):
                 await self.bot.handle_callback_action(self.event, 'sms_send:confirm:'+state['flow_id'], 1, 10)
                 self.bot.send_sms.assert_not_awaited()
 
+    async def test_callback_ui_failures_do_not_discard_a_confirmed_submission(self):
+        for failed in ('answer', 'edit'):
+            with self.subTest(failed=failed):
+                token = await self.prepare()
+                self.event = SimpleNamespace(edit=AsyncMock(), answer=AsyncMock())
+                getattr(self.event, failed).side_effect = ConnectionError('synthetic UI failure')
+                self.bot.send_sms.reset_mock()
+                with contextlib.redirect_stdout(io.StringIO()):
+                    await self.bot.handle_callback_action(self.event, 'sms_send:confirm:'+token, 1, 10)
+                self.bot.send_sms.assert_awaited_once()
+                self.assertNotIn(1, self.bot.user_states)
+                self.event.answer.side_effect = None
+                self.event.edit.side_effect = None
+                await self.bot.handle_callback_action(self.event, 'sms_send:confirm:'+token, 1, 10)
+                self.bot.send_sms.assert_awaited_once()
+                self.bot.send_sms.reset_mock()
+
     async def test_empty_content_is_not_accepted(self):
         state = {'action': 'send_sms', 'device_id': 'quectel1', 'flow_id': 'old'}
         self.bot.user_states[1] = state

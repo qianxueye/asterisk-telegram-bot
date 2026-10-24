@@ -8,6 +8,8 @@ The Bot displays the complete normalized destination, device and escaped message
 
 Drafts remain bound to their originating chat during recipient entry and edits. Oversized previews show the complete body in plain-text chunks of at most 1,500 Unicode code points (at most 3,000 UTF-16 units), then show destination metadata and controls. Every body chunk and the control message must have confirmed Telegram delivery before the draft can be submitted. Partial or uncertain preview delivery keeps the draft in number-entry state without enabling submission.
 
+Once the user confirms a fully delivered preview, callback acknowledgements and progress-message edits are best-effort UI operations. Their failure does not discard the authorized submission or restore the consumed token. Submission and result reporting remain handled by the existing SMS send path, without automatic retries.
+
 Replies use the original sender address, including service short codes, without adding `+86`. The shared send boundary rejects nonnumeric/control-bearing destinations before invoking the CLI. It does not rewrite reply addresses.
 
 ## Reviewed interface copy
