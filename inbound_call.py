@@ -79,8 +79,12 @@ def normalize_caller(value):
     number = re.sub(r'[\s()-]', '', value)
     if number.startswith('+86'):
         number = number[3:]
+        if number.startswith('21'):
+            number = '0' + number
     elif number.startswith('0086'):
         number = number[4:]
+        if number.startswith('21'):
+            number = '0' + number
     return number if CALLER.fullmatch(number) else None
 
 

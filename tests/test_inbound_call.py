@@ -1,9 +1,11 @@
 import asyncio
+import fcntl
 import importlib.util
 import io
 import json
 import os
 import random
+import select
 import struct
 import tempfile
 import threading
@@ -37,10 +39,10 @@ def device_rows(*devices):
         f'{device} 0 Start 20 0 Provider Model Firmware\n' for device in devices)
 
 
-def audio(symbols, amplitude=1800, noise=0, duration=.16, gap=.12):
+def audio(symbols, amplitude=1800, noise=0, duration=.16, gap=.12, lead=0):
     import math
     rng = random.Random(42)
-    samples = []
+    samples = [0] * int(RATE * lead)
     for symbol in symbols:
         low, high = FREQUENCIES[symbol]
         for index in range(int(RATE * duration)):
@@ -52,17 +54,42 @@ def audio(symbols, amplitude=1800, noise=0, duration=.16, gap=.12):
     return struct.pack('<' + str(len(samples)) + 'h', *samples)
 
 
-def collect_bytes(data, length):
+def collect_bytes(data, length, pipe_size=None):
     read, write = os.pipe()
-    try:
-        os.write(write, data)
-        os.close(write)
-        write = None
-        return collect(read, length, timeout=.2)
-    finally:
-        os.close(read)
-        if write is not None:
+    if pipe_size is not None and hasattr(fcntl, 'F_SETPIPE_SZ'):
+        fcntl.fcntl(write, fcntl.F_SETPIPE_SZ, pipe_size)
+        assert fcntl.fcntl(write, fcntl.F_GETPIPE_SZ) <= pipe_size
+    errors = []
+    stopped = threading.Event()
+    os.set_blocking(write, False)
+    def produce():
+        try:
+            offset = 0
+            while offset < len(data) and not stopped.is_set():
+                if not select.select([], [write], [], .05)[1]:
+                    continue
+                try:
+                    offset += os.write(write, data[offset:offset + 2048])
+                except BlockingIOError:
+                    continue
+        except BrokenPipeError:
+            pass
+        except Exception as exc:
+            errors.append(exc)
+        finally:
             os.close(write)
+    worker = threading.Thread(target=produce)
+    worker.start()
+    try:
+        return collect(read, length, timeout=2)
+    finally:
+        stopped.set()
+        os.close(read)
+        worker.join(timeout=2)
+        if worker.is_alive():
+            raise AssertionError('audio producer did not stop')
+        if errors:
+            raise errors[0]
 
 
 class PolicyTests(unittest.TestCase):
@@ -83,6 +110,11 @@ class PolicyTests(unittest.TestCase):
         for value in ('0211234567', '02112345678', '+86 02112345678', '0086-0211234567'):
             self.assertEqual(normalize_caller(value), value.replace('+86', '').replace('0086', '').replace(' ', '').replace('-', ''))
         for value in ('021123456', '021123456789', '021123456x', '+1 0211234567', '8610211234567', '0211234567#'):
+            self.assertIsNone(normalize_caller(value))
+        for value, expected in (('+86211234567', '0211234567'), ('0086211234567', '0211234567'),
+                                ('+862112345678', '02112345678'), ('00862112345678', '02112345678')):
+            self.assertEqual(normalize_caller(value), expected)
+        for value in ('+8621123456', '008621123456789', '+862212345678', '+8613812345678'):
             self.assertIsNone(normalize_caller(value))
 
     def test_live_line_state_requires_matching_device_and_valid_identity(self):
@@ -235,6 +267,18 @@ class PolicyTests(unittest.TestCase):
 
 
 class AudioTests(unittest.TestCase):
+    def test_eighty_ms_tones_and_gaps_at_frame_offsets(self):
+        for lead in (0, .005, .01, .015, .02, .025, .035):
+            with self.subTest(lead=lead):
+                self.assertEqual(collect_bytes(audio('11#2', duration=.08, gap=.08, lead=lead), 4), '11#2')
+                self.assertEqual(collect_bytes(audio('11#2', duration=.08, gap=.04, lead=lead), 4), '11#2')
+
+    def test_short_interruption_does_not_make_two_repeated_digits(self):
+        interrupted = (audio('1', duration=.2, gap=0) + b'\0' * (RATE * 2 // 50) +
+                       audio('1', duration=.2, gap=.08))
+        with self.assertRaises(CallEnded):
+            collect_bytes(interrupted, 2)
+
     def test_noisy_low_level_and_repeated_digits(self):
         self.assertEqual(collect_bytes(audio('12#2', amplitude=700, noise=250), 4), '12#2')
         self.assertEqual(collect_bytes(audio('11', amplitude=1400, noise=100), 2), '11')
@@ -248,6 +292,28 @@ class AudioTests(unittest.TestCase):
         self.assertEqual([detector.feed(noise[i:i+640]) for i in range(0, len(noise), 640)], [None] * 10)
         with self.assertRaises(CallEnded):
             collect_bytes(audio('1', duration=.04), 1)
+
+    def test_speech_like_multifrequency_and_large_pipe_payload_do_not_complete(self):
+        import math
+        rng = random.Random(31)
+        samples = [int(1000 * math.sin(2 * math.pi * 440 * n / RATE) +
+                       700 * math.sin(2 * math.pi * 880 * n / RATE) +
+                       350 * math.sin(2 * math.pi * 1760 * n / RATE) +
+                       rng.uniform(-500, 500)) for n in range(RATE)]
+        fake = struct.pack('<' + str(len(samples)) + 'h', *samples)
+        with self.assertRaises(CallEnded):
+            collect_bytes(fake, 1, pipe_size=4096)
+        large = audio('1234', duration=.08, gap=.08) + fake * 8
+        self.assertGreater(len(large), 65536)
+        self.assertEqual(collect_bytes(large, 4, pipe_size=4096), '1234')
+
+    def test_collection_deadline_with_open_silent_pipe(self):
+        read, write = os.pipe()
+        try:
+            self.assertIsNone(collect(read, 1, timeout=.02))
+        finally:
+            os.close(read)
+            os.close(write)
 
     def test_disconnect_and_private_replay_file(self):
         read, write = os.pipe()
@@ -269,6 +335,34 @@ class AudioTests(unittest.TestCase):
             with wave.open(high, 'rb') as wav:
                 loud = struct.unpack('<' + str(wav.getnframes()) + 'h', wav.readframes(wav.getnframes()))
             self.assertGreater(max(loud), max(quiet) * 5)
+
+    def test_stale_replay_disappearing_during_cleanup_is_benign(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stale = Path(directory) / 'tone-stale.wav'
+            stale.write_bytes(b'old')
+            age = time.time() - 180
+            os.utime(stale, (age, age))
+            real_unlink = os.unlink
+            def raced_unlink(path):
+                if path == str(stale):
+                    real_unlink(path)
+                    raise FileNotFoundError(path)
+                real_unlink(path)
+            with patch('inbound_call_eagi.os.unlink', side_effect=raced_unlink):
+                fresh = _write_replay('1', 10, directory)
+            self.assertFalse(stale.exists())
+            self.assertTrue(Path(fresh).exists())
+            Path(fresh).unlink()
+
+    def test_stale_replay_cleanup_keeps_permission_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            stale = Path(directory) / 'tone-stale.wav'
+            stale.write_bytes(b'old')
+            age = time.time() - 180
+            os.utime(stale, (age, age))
+            with patch('inbound_call_eagi.os.unlink', side_effect=PermissionError('denied')):
+                with self.assertRaises(PermissionError):
+                    _write_replay('1', 10, directory)
 
 
 class EagiTests(unittest.TestCase):

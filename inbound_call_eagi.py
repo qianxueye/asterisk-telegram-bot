@@ -17,6 +17,7 @@ from inbound_call import InboundCallPolicy, matches_secret, sim_identities
 
 RATE = 8000
 FRAME = 320
+HOP = 80
 ROWS = (697, 770, 852, 941)
 COLS = (1209, 1336, 1477, 1633)
 SYMBOLS = ('123A', '456B', '789C', '*0#D')
@@ -63,7 +64,7 @@ class ToneCollector:
     def __init__(self):
         self.candidate = None
         self.frames = 0
-        self.quiet = 2
+        self.quiet = 3
         self.armed = True
 
     def feed(self, frame):
@@ -72,7 +73,7 @@ class ToneCollector:
             self.candidate = None
             self.frames = 0
             self.quiet += 1
-            if self.quiet >= 2:
+            if self.quiet >= 3:
                 self.armed = True
             return None
         self.quiet = 0
@@ -80,7 +81,7 @@ class ToneCollector:
             self.candidate, self.frames = tone, 1
         else:
             self.frames += 1
-        if self.armed and self.frames >= 3:
+        if self.armed and self.frames >= 4:
             self.armed = False
             return tone
         return None
@@ -104,7 +105,7 @@ def collect(fd, length, timeout=15, clock=time.monotonic):
         buffer += chunk
         while len(buffer) >= FRAME * 2:
             symbol = detector.feed(buffer[:FRAME * 2])
-            buffer = buffer[FRAME * 2:]
+            buffer = buffer[HOP * 2:]
             if symbol:
                 symbols.append(symbol)
                 if len(symbols) == length:
@@ -142,9 +143,12 @@ def _write_replay(symbols, volume, directory=TONE_DIR):
         for index, entry in enumerate(entries):
             if index >= 1024:
                 raise ValueError('tone directory capacity')
-            if (entry.name.startswith('tone-') and entry.name.endswith('.wav') and
-                    entry.is_file(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_mtime < cutoff):
-                os.unlink(entry.path)
+            if entry.name.startswith('tone-') and entry.name.endswith('.wav'):
+                try:
+                    if entry.is_file(follow_symlinks=False) and entry.stat(follow_symlinks=False).st_mtime < cutoff:
+                        os.unlink(entry.path)
+                except FileNotFoundError:
+                    continue
     fd, path = tempfile.mkstemp(prefix='tone-', suffix='.wav', dir=directory)
     try:
         with os.fdopen(fd, 'wb') as output:
