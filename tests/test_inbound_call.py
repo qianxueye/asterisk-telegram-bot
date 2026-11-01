@@ -14,12 +14,13 @@ import wave
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from inbound_call import InboundCallPolicy, PolicyWriteUncertain, matches_secret, normalize_caller, sim_identity
+from inbound_call import InboundCallPolicy, PolicyWriteUncertain, matches_secret, normalize_caller, sim_identities
 from inbound_call_eagi import CallEnded, FREQUENCIES, RATE, ToneCollector, _write_replay, collect, handle_call
 
 
 SIM = 'iccid:12345678901234567890'
 OTHER = 'iccid:22345678901234567890'
+IMSI = 'imsi:123456789012345'
 
 
 def audio(symbols, amplitude=1800, noise=0, duration=.16, gap=.12):
@@ -61,9 +62,10 @@ class PolicyTests(unittest.TestCase):
         self.policy = InboundCallPolicy(Path(self.temp.name) / 'state.json', clock=lambda: self.now)
 
     def test_identity_and_caller_filter(self):
-        self.assertEqual(sim_identity({'iccid': SIM.split(':')[1], 'imsi': '123456789012345'}), SIM)
-        self.assertIsNone(sim_identity({'iccid': 'invalid', 'imsi': '123456789012345'}))
-        self.assertIsNone(sim_identity({'name': 'quectel1'}))
+        self.assertEqual(sim_identities({'iccid': SIM.split(':')[1], 'imsi': '123456789012345'}),
+                         (SIM, 'imsi:123456789012345'))
+        self.assertEqual(sim_identities({'iccid': 'invalid', 'imsi': '123456789012345'}), ())
+        self.assertEqual(sim_identities({'name': 'quectel1'}), ())
         for value in ('0211234567', '02112345678', '+86 02112345678', '0086-0211234567'):
             self.assertEqual(normalize_caller(value), value.replace('+86', '').replace('0086', '').replace(' ', '').replace('-', ''))
         for value in ('021123456', '021123456789', '021123456x', '+1 0211234567', '8610211234567', '0211234567#'):
@@ -84,6 +86,17 @@ class PolicyTests(unittest.TestCase):
         self.assertIsNone(self.policy.snapshot(OTHER, 'other'))
         self.now = 1030
         self.assertIsNone(self.policy.snapshot(SIM, 'other'))
+
+    def test_both_channel_identifiers_select_one_policy_or_fail_on_conflict(self):
+        self.policy.update(IMSI, 'mode', 'direct')
+        identities = sim_identities({'iccid': SIM.split(':')[1], 'imsi': IMSI.split(':')[1]})
+        self.assertEqual(self.policy.snapshot(identities, '0211234567')['mode'], 'direct')
+        self.policy.update(SIM, 'mode', 'forward')
+        self.assertIsNone(self.policy.snapshot(identities, '0211234567'))
+        self.policy.update(SIM, 'mode', 'direct')
+        self.assertIsNone(self.policy.snapshot(identities, '0211234567'))
+        self.policy.update(OTHER, 'mode', 'direct')
+        self.assertIsNone(self.policy.snapshot((OTHER, IMSI), '0211234567'))
 
     def test_secret_hash_permissions_and_fail_safe_config(self):
         self.policy.update(SIM, 'secret', '12#*')
@@ -244,6 +257,18 @@ class EagiTests(unittest.TestCase):
         self.assertNotIn('ANSWER', commands)
         outcome, commands, _ = self.run_call({'iccid': SIM.split(':')[1]}, '0211234567', state='Up')
         self.assertEqual(outcome, 'forward')
+        self.assertNotIn('ANSWER', commands)
+
+    def test_imsi_policy_with_iccid_present_and_conflict_falls_back(self):
+        other_policy = InboundCallPolicy(Path(self.temp.name) / 'imsi.json', clock=lambda: 1000)
+        other_policy.update(IMSI, 'mode', 'direct')
+        metadata = {'iccid': SIM.split(':')[1], 'imsi': IMSI.split(':')[1]}
+        result, commands, _ = self.run_call(metadata, '0211234567', '200 result=0\n' * 6, policy=other_policy)
+        self.assertEqual(result, 'sent')
+        self.assertIn('ANSWER', commands)
+        other_policy.update(SIM, 'mode', 'direct')
+        result, commands, _ = self.run_call(metadata, '0211234567', policy=other_policy)
+        self.assertEqual(result, 'forward')
         self.assertNotIn('ANSWER', commands)
 
     def test_direct_sends_three_fixed_digits_with_spacing(self):

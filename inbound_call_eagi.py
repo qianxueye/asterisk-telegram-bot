@@ -12,7 +12,7 @@ import tempfile
 import time
 import wave
 
-from inbound_call import InboundCallPolicy, matches_secret, sim_identity
+from inbound_call import InboundCallPolicy, matches_secret, sim_identities
 
 
 RATE = 8000
@@ -181,8 +181,8 @@ def handle_call(source=sys.stdin, sink=sys.stdout, audio_fd=3, policy=None, tone
         return 'forward'
     policy = policy or InboundCallPolicy()
     try:
-        sim = sim_identity(json.loads(variable('QUECTEL', source, sink)))
-        if not sim:
+        identities = sim_identities(json.loads(variable('QUECTEL', source, sink)))
+        if not identities:
             return 'forward'
         if variable('CHANNEL(state)', source, sink) == 'Up':
             return 'forward'
@@ -190,7 +190,7 @@ def handle_call(source=sys.stdin, sink=sys.stdout, audio_fd=3, policy=None, tone
             caller = variable('CALLERID(num)', source, sink)
         except ValueError:
             caller = ''
-        item = policy.snapshot(sim, caller)
+        item = policy.snapshot(identities, caller)
         if item is None:
             return 'forward'
         agi('SET VARIABLE INBOUND_CALL_SELECTED 1', source, sink)

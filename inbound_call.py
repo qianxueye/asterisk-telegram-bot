@@ -26,14 +26,17 @@ class PolicyWriteUncertain(OSError):
     pass
 
 
-def sim_identity(metadata):
+def sim_identities(metadata):
     if not isinstance(metadata, dict):
-        return None
+        return ()
+    identities = []
     for field in ('iccid', 'imsi'):
         value = metadata.get(field)
         if value is not None and value != '':
-            return field + ':' + value if isinstance(value, str) and SIM_ID.fullmatch(field + ':' + value) else None
-    return None
+            if not isinstance(value, str) or not SIM_ID.fullmatch(field + ':' + value):
+                return ()
+            identities.append(field + ':' + value)
+    return tuple(identities)
 
 
 def normalize_caller(value):
@@ -83,11 +86,16 @@ class InboundCallPolicy:
         except (OSError, ValueError, TypeError):
             return None
 
-    def snapshot(self, sim, caller):
+    def snapshot(self, identities, caller):
         state = self.load()
-        if state is None or sim not in state['sims']:
+        if state is None:
             return None
-        item = state['sims'][sim]
+        if isinstance(identities, str):
+            identities = (identities,)
+        matches = [sim for sim in identities if sim in state['sims']]
+        if len(matches) != 1:
+            return None
+        item = state['sims'][matches[0]]
         if item['mode'] == 'forward':
             return None
         if item['mode'] == 'protected' and not item['digest']:
