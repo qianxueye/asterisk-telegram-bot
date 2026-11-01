@@ -218,10 +218,7 @@ def handle_call(source=sys.stdin, sink=sys.stdout, audio_fd=3, policy=None, tone
                     os.unlink(path)
             if not matched:
                 return 'mismatch'
-        for index in range(3):
-            if index:
-                time.sleep(1.5)
-            agi('EXEC SendDTMF #,1500,100', source, sink)
+        agi('EXEC SendDTMF ###,1500,100', source, sink)
         return 'sent'
     except (OSError, ValueError, CallEnded):
         return 'ended'

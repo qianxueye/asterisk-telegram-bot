@@ -405,20 +405,62 @@ class EagiTests(unittest.TestCase):
         other_policy = InboundCallPolicy(Path(self.temp.name) / 'imsi.json', clock=lambda: 1000)
         other_policy.update(IMSI, 'mode', 'direct')
         metadata = {'iccid': SIM.split(':')[1], 'imsi': IMSI.split(':')[1]}
-        result, commands, _ = self.run_call(metadata, '0211234567', '200 result=0\n' * 6, policy=other_policy)
+        result, commands, _ = self.run_call(metadata, '0211234567', '200 result=0\n' * 4, policy=other_policy)
         self.assertEqual(result, 'sent')
         self.assertIn('ANSWER', commands)
+        self.assertEqual(commands.count('EXEC SendDTMF ###,1500,100'), 1)
         other_policy.update(SIM, 'mode', 'direct')
         result, commands, _ = self.run_call(metadata, '0211234567', policy=other_policy)
         self.assertEqual(result, 'forward')
         self.assertNotIn('ANSWER', commands)
 
     def test_direct_sends_three_fixed_digits_with_spacing(self):
-        results = '200 result=0\n' * 6
+        results = '200 result=0\n' * 4
         outcome, commands, sleep = self.run_call({'iccid': SIM.split(':')[1]}, '0211234567', results)
         self.assertEqual(outcome, 'sent')
-        self.assertEqual(commands.count('EXEC SendDTMF #,1500,100'), 3)
-        self.assertEqual([call.args for call in sleep.call_args_list], [(1.5,), (1.5,)])
+        send_commands = [line for line in commands.splitlines() if line.startswith('EXEC SendDTMF ')]
+        self.assertEqual(send_commands, ['EXEC SendDTMF ###,1500,100'])
+        digits, gap, duration = send_commands[0].removeprefix('EXEC SendDTMF ').split(',')
+        self.assertEqual(len(digits), 3)
+        gap, duration = int(gap), int(duration)
+        ends = [duration]
+        starts = [0]
+        for _ in digits[1:]:
+            starts.append(ends[-1] + gap)
+            ends.append(starts[-1] + duration)
+        self.assertEqual([start - end for start, end in zip(starts[1:], ends[:-1])], [1500, 1500])
+        sleep.assert_not_called()
+        self.assertNotIn('HANGUP\n', commands)
+
+    def test_direct_waits_for_senddtmf_completion_before_returning(self):
+        sink = io.StringIO()
+        waiting = threading.Event()
+        resume = threading.Event()
+        class WaitingSource(io.StringIO):
+            def readline(self, *args):
+                if sink.getvalue().endswith('EXEC SendDTMF ###,1500,100\n'):
+                    waiting.set()
+                    if not resume.wait(2):
+                        raise TimeoutError('SendDTMF response withheld')
+                return super().readline(*args)
+        source = WaitingSource('agi_request: test\n\n200 result=1 (' +
+                               json.dumps({'iccid': SIM.split(':')[1]}) + ')\n'
+                               '200 result=1 (Ring)\n200 result=1 (0211234567)\n' +
+                               '200 result=0\n' * 4)
+        result = []
+        worker = threading.Thread(target=lambda: result.append(handle_call(source, sink, policy=self.policy,
+                                                                            tone_dir=self.tone_dir)))
+        worker.start()
+        try:
+            self.assertTrue(waiting.wait(2))
+            self.assertTrue(worker.is_alive())
+            self.assertEqual(result, [])
+        finally:
+            resume.set()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, ['sent'])
+        self.assertEqual(sink.getvalue().count('EXEC SendDTMF ###,1500,100'), 1)
 
     def test_protected_full_mismatch_timeout_and_match(self):
         self.policy.update(SIM, 'secret', '12#')
@@ -435,10 +477,13 @@ class EagiTests(unittest.TestCase):
             self.assertNotIn('12*', commands)
             self.assertNotIn('SendDTMF', commands)
         with patch('inbound_call_eagi.collect', return_value='12#'):
-            result, commands, _ = self.run_call(metadata, '0211234567', '200 result=0\n' * 7)
+            result, commands, _ = self.run_call(metadata, '0211234567', '200 result=0\n' * 5)
             self.assertEqual(result, 'sent')
-            self.assertEqual(commands.count('EXEC SendDTMF #,1500,100'), 3)
+            self.assertEqual(commands.count('EXEC SendDTMF ###,1500,100'), 1)
             self.assertNotIn('12#', commands)
+            result, commands, _ = self.run_call(metadata, '0211234567', '200 result=0\n' * 4 + '200 result=-1\n')
+            self.assertEqual(result, 'ended')
+            self.assertEqual(commands.count('EXEC SendDTMF ###,1500,100'), 1)
 
     def test_selection_answer_disconnect_and_playback_failures(self):
         metadata = {'iccid': SIM.split(':')[1]}
@@ -455,7 +500,7 @@ class EagiTests(unittest.TestCase):
         self.assertNotIn('SendDTMF', commands)
         result, commands, _ = self.run_call(metadata, '0211234567', '200 result=0\n' * 3 + '200 result=-1\n')
         self.assertEqual(result, 'ended')
-        self.assertEqual(commands.count('EXEC SendDTMF #,1500,100'), 1)
+        self.assertEqual(commands.count('EXEC SendDTMF ###,1500,100'), 1)
         self.policy.update(SIM, 'secret', '12#')
         self.policy.update(SIM, 'mode', 'protected')
         with patch('inbound_call_eagi.collect', side_effect=CallEnded):
