@@ -28,6 +28,7 @@ from telethon.tl.types import UpdateNewMessage, Message
 from telethon.tl.custom import Button
 from config import Config
 from sms_guard import SmsFloodGuard, DEVICE
+from inbound_call import InboundCallPolicy, PolicyWriteUncertain, SIM_ID
 
 
 class AsteriskBot:
@@ -38,6 +39,7 @@ class AsteriskBot:
         ('device_statistics', '查看设备统计'), ('recover_numbers', '恢复设备本机号码'),
         ('uac_recover', '检查与恢复 UAC 音频'), ('pending_sms', '查看待确认发送记录'),
         ('sms_notifications', '设置短信发送通知'), ('sms_guard', '短信防护'),
+        ('inbound_call', '设置指定 SIM 的来电处理'),
         ('add_user', '添加授权用户'), ('remove_user', '移除授权用户'),
         ('test_sms_log', '测试短信日志解析'), ('check_sms_logs', '查看近期短信日志'),
     )
@@ -68,6 +70,7 @@ class AsteriskBot:
         self.uac_error_events = defaultdict(list)
         self.uac_recovery_state = self.load_uac_recovery_state()
         self.sms_guard = SmsFloodGuard(os.getenv('SMS_GUARD_STATE_FILE', os.path.join(os.path.dirname(os.path.abspath(__file__)), '.sms_guard_state.json')))
+        self.inbound_call = InboundCallPolicy()
         self.sms_outbox = asyncio.Queue(maxsize=64)
         self.sms_queue_dropped = 0
         self.background_tasks = []
@@ -473,7 +476,14 @@ class AsteriskBot:
                     return
                 
                 # 检查用户状态
-                if text and text.split()[0].split('@')[0] == '/sms_guard':
+                if text and text.split()[0].split('@')[0] == '/inbound_call':
+                    if text.split(maxsplit=2)[1:2] == ['secret']:
+                        try:
+                            await event.delete()
+                        except Exception:
+                            pass
+                    await self.handle_inbound_call_command(chat_id, text, user_id)
+                elif text and text.split()[0].split('@')[0] == '/sms_guard':
                     await self.handle_sms_guard_command(chat_id, text, user_id)
                 elif user_id in self.user_states:
                     await self.handle_user_state_message(chat_id, user_id, text)
@@ -510,6 +520,8 @@ class AsteriskBot:
                 await self.handle_help_command(chat_id, user_id)
             elif text and text.split()[0].split('@')[0] == '/sms_guard':
                 await self.handle_sms_guard_command(chat_id, text, user_id)
+            elif text and text.split()[0].split('@')[0] == '/inbound_call':
+                await self.handle_inbound_call_command(chat_id, text, user_id)
             elif text.startswith('/send_sms'):
                 await self.handle_send_sms_command(chat_id, text, user_id)
             elif text.startswith('/devices'):
@@ -3081,6 +3093,58 @@ class AsteriskBot:
     def queue_guard_notice(self, device, transition):
         kind, dropped = transition
         self.queue_sms_item({'notice': kind, 'device_id': device, 'dropped': dropped})
+
+    async def handle_inbound_call_command(self, chat_id, text, user_id):
+        if not Config.is_authorized(user_id):
+            return
+        try:
+            parts = text.split()
+            if len(parts) == 1 or parts[1] == 'status':
+                if len(parts) > 2:
+                    raise ValueError('usage')
+                state = self.inbound_call.load()
+                if state is None or not state['sims']:
+                    message = ('来电设置读取失败；来电照常转接 3CX。请联系管理员检查。' if self.inbound_call.path.exists()
+                               and state is None else '来电处理未配置；来电照常转接 3CX。')
+                    await self.send_message(chat_id, message, parse_mode=None)
+                    return
+                labels = {'forward': '转接 3CX', 'direct': '直接应答', 'protected': '口令应答'}
+                lines = ['来电处理']
+                for sim, item in sorted(state['sims'].items()):
+                    remaining = max(0, int(item['test_until'] - self.inbound_call.clock()))
+                    line = f"{sim[:sim.index(':')]} 尾号 {sim[-4:]}：{labels[item['mode']]}，口令回放音量 {item['volume']}%"
+                    line += f'，测试：开启（剩余 {remaining} 秒）' if remaining else '，测试：关闭'
+                    lines.append(line)
+                await self.send_message(chat_id, '\n'.join(lines), parse_mode=None)
+                return
+            if len(parts) != 4 or not SIM_ID.fullmatch(parts[2]):
+                raise ValueError('usage')
+            action, sim, value = parts[1:]
+            if action == 'mode':
+                self.inbound_call.update(sim, action, value)
+            elif action == 'secret':
+                self.inbound_call.update(sim, action, value)
+            elif action in ('volume', 'test'):
+                self.inbound_call.update(sim, action, int(value))
+            else:
+                raise ValueError('usage')
+        except PolicyWriteUncertain:
+            await self.send_message(chat_id, '保存过程没有返回结果。请先查询 /inbound_call status；口令可重新设置。', parse_mode=None)
+            return
+        except OSError:
+            await self.send_message(chat_id, '来电设置未写入。请联系管理员检查保存目录。', parse_mode=None)
+            return
+        except (ValueError, TypeError) as exc:
+            if isinstance(exc, ValueError) and str(exc) == 'secret required':
+                await self.send_message(chat_id, '请先设置该 SIM 的口令，再启用口令应答。', parse_mode=None)
+                return
+            await self.send_message(chat_id,
+                '设置未保存。用法：/inbound_call mode iccid:号码 forward|direct|protected；'
+                '/inbound_call secret iccid:号码 口令；/inbound_call volume iccid:号码 1-30；'
+                '/inbound_call test iccid:号码 秒数（0-900）；/inbound_call status。也可使用 imsi:号码。',
+                parse_mode=None)
+            return
+        await self.send_message(chat_id, '设置已保存。', parse_mode=None)
 
     async def handle_sms_guard_command(self, chat_id, text, user_id):
         if not Config.is_authorized(user_id):
