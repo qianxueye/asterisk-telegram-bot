@@ -300,6 +300,22 @@ class PolicyTests(unittest.TestCase):
 
 
 class AudioTests(unittest.TestCase):
+    def test_quiet_telephone_tones_decode_without_noise_false_hits(self):
+        for expected in ('2580', '2581'):
+            with self.subTest(expected=expected):
+                signal = telephone_audio(expected, noise=1000, twist=.45)
+                samples = struct.unpack('<' + str(len(signal) // 2) + 'h', signal)
+                quiet = struct.pack('<' + str(len(samples)) + 'h', *(round(sample * .02) for sample in samples))
+                self.assertEqual(collect_bytes(quiet, 4), expected)
+                with patch('inbound_call_eagi.MIN_WINDOW_ENERGY', 320 * 110 ** 2):
+                    with self.assertRaises(CallEnded):
+                        collect_bytes(quiet, 4)
+
+        rng = random.Random(52)
+        noise = struct.pack('<120000h', *(rng.randrange(-40, 41) for _ in range(RATE * 15)))
+        with self.assertRaises(CallEnded):
+            collect_bytes(noise, 1)
+
     def test_four_window_tone_cluster_and_repeated_digit_boundary(self):
         detector = ToneCollector()
         with patch('inbound_call_eagi.detect_tone', side_effect=['2'] * 4 + [None] * 2 + ['2'] * 4):

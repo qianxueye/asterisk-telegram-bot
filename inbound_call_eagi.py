@@ -25,6 +25,7 @@ TONE_DIR = '/var/lib/asterisk/sounds/inbound-dtmf-private'
 FREQUENCIES = {SYMBOLS[row][col]: (ROWS[row], COLS[col]) for row in range(4) for col in range(4)}
 WINDOW = tuple(.5 - .5 * math.cos(2 * math.pi * n / (FRAME - 1)) for n in range(FRAME))
 MIN_TONE_POWER_RATIO = 6
+MIN_WINDOW_ENERGY = 320 * 5 ** 2
 
 
 class CallEnded(Exception):
@@ -49,7 +50,7 @@ def detect_tone(frame):
         return None
     samples = struct.unpack('<320h', frame)
     energy = sum((sample * window) ** 2 for sample, window in zip(samples, WINDOW))
-    if energy < 320 * 110 ** 2:
+    if energy < MIN_WINDOW_ENERGY:
         return None
     row = sorted((( _power(samples, frequency), index) for index, frequency in enumerate(ROWS)), reverse=True)
     col = sorted((( _power(samples, frequency), index) for index, frequency in enumerate(COLS)), reverse=True)
