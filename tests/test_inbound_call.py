@@ -300,6 +300,15 @@ class PolicyTests(unittest.TestCase):
 
 
 class AudioTests(unittest.TestCase):
+    def test_four_window_tone_cluster_and_repeated_digit_boundary(self):
+        detector = ToneCollector()
+        with patch('inbound_call_eagi.detect_tone', side_effect=['2'] * 4 + [None] * 2 + ['2'] * 4):
+            emitted = [detector.feed(b'') for _ in range(10)]
+        self.assertEqual([symbol for symbol in emitted if symbol], ['2', '2'])
+        detector = ToneCollector()
+        with patch('inbound_call_eagi.detect_tone', side_effect=['2'] * 3):
+            self.assertEqual([detector.feed(b'') for _ in range(3)], [None] * 3)
+
     def test_telephone_degradation_preserves_complete_sequence(self):
         for noise, twist in ((1000, .45), (2000, .6), (2500, 1)):
             for lead in (0, .005, .015):

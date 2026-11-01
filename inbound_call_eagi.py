@@ -85,7 +85,7 @@ class ToneCollector:
             self.candidate, self.hits, self.first_hit = tone, 1, self.index
         else:
             self.hits += 1
-        if self.armed and self.hits >= 3 and self.index - self.first_hit >= 4:
+        if self.armed and self.hits >= 3 and self.index - self.first_hit >= 3:
             self.armed = False
             return tone
         return None
