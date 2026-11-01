@@ -70,6 +70,8 @@ class ToneCollector:
         self.index = 0
         self.quiet = 2
         self.armed = True
+        self.last_symbol = None
+        self.last_index = -100
 
     def feed(self, frame):
         self.index += 1
@@ -88,6 +90,9 @@ class ToneCollector:
             self.hits += 1
         if self.armed and self.hits >= 3 and self.index - self.first_hit >= 3:
             self.armed = False
+            if tone == self.last_symbol and self.index - self.last_index < 8:
+                return None
+            self.last_symbol, self.last_index = tone, self.index
             return tone
         return None
 

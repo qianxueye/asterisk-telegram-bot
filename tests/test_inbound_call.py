@@ -318,12 +318,24 @@ class AudioTests(unittest.TestCase):
 
     def test_four_window_tone_cluster_and_repeated_digit_boundary(self):
         detector = ToneCollector()
-        with patch('inbound_call_eagi.detect_tone', side_effect=['2'] * 4 + [None] * 2 + ['2'] * 4):
-            emitted = [detector.feed(b'') for _ in range(10)]
+        with patch('inbound_call_eagi.detect_tone', side_effect=['2'] * 4 + [None] * 5 + ['2'] * 4):
+            emitted = [detector.feed(b'') for _ in range(13)]
         self.assertEqual([symbol for symbol in emitted if symbol], ['2', '2'])
         detector = ToneCollector()
         with patch('inbound_call_eagi.detect_tone', side_effect=['2'] * 3):
             self.assertEqual([detector.feed(b'') for _ in range(3)], [None] * 3)
+
+    def test_mid_tone_erasure_does_not_duplicate_a_digit(self):
+        for lead in (0, .005, .015):
+            for at in (.03, .04, .05):
+                with self.subTest(lead=lead, at=at):
+                    signal = audio('2580', duration=.1, gap=.1, lead=lead)
+                    samples = list(struct.unpack('<' + str(len(signal) // 2) + 'h', signal))
+                    for digit in range(4):
+                        start = int((lead + digit * .2 + at) * RATE)
+                        samples[start:start + 240] = [0] * 240
+                    damaged = struct.pack('<' + str(len(samples)) + 'h', *samples)
+                    self.assertEqual(collect_bytes(damaged, 4), '2580')
 
     def test_telephone_degradation_preserves_complete_sequence(self):
         for noise, twist in ((1000, .45), (2000, .6), (2500, 1)):
