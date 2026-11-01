@@ -24,6 +24,7 @@ SYMBOLS = ('123A', '456B', '789C', '*0#D')
 TONE_DIR = '/var/lib/asterisk/sounds/inbound-dtmf-private'
 FREQUENCIES = {SYMBOLS[row][col]: (ROWS[row], COLS[col]) for row in range(4) for col in range(4)}
 WINDOW = tuple(.5 - .5 * math.cos(2 * math.pi * n / (FRAME - 1)) for n in range(FRAME))
+MIN_TONE_POWER_RATIO = 6
 
 
 class CallEnded(Exception):
@@ -54,8 +55,8 @@ def detect_tone(frame):
     col = sorted((( _power(samples, frequency), index) for index, frequency in enumerate(COLS)), reverse=True)
     strongest_row, strongest_col = row[0][0], col[0][0]
     if (strongest_row < row[1][0] * 3.5 or strongest_col < col[1][0] * 3.5 or
-            strongest_row < energy * 26 or strongest_col < energy * 26 or
-            not .22 <= strongest_row / strongest_col <= 4.5):
+            strongest_row < energy * MIN_TONE_POWER_RATIO or strongest_col < energy * MIN_TONE_POWER_RATIO or
+            not .12 <= strongest_row / strongest_col <= 8):
         return None
     return SYMBOLS[row[0][1]][col[0][1]]
 
@@ -63,25 +64,28 @@ def detect_tone(frame):
 class ToneCollector:
     def __init__(self):
         self.candidate = None
-        self.frames = 0
-        self.quiet = 3
+        self.hits = 0
+        self.first_hit = 0
+        self.index = 0
+        self.quiet = 2
         self.armed = True
 
     def feed(self, frame):
+        self.index += 1
         tone = detect_tone(frame)
         if tone is None:
-            self.candidate = None
-            self.frames = 0
             self.quiet += 1
-            if self.quiet >= 3:
+            if self.quiet >= 2 and not self.armed:
                 self.armed = True
+                self.candidate = None
+                self.hits = 0
             return None
         self.quiet = 0
-        if tone != self.candidate:
-            self.candidate, self.frames = tone, 1
+        if tone != self.candidate or self.index - self.first_hit > 8:
+            self.candidate, self.hits, self.first_hit = tone, 1, self.index
         else:
-            self.frames += 1
-        if self.armed and self.frames >= 4:
+            self.hits += 1
+        if self.armed and self.hits >= 3 and self.index - self.first_hit >= 4:
             self.armed = False
             return tone
         return None

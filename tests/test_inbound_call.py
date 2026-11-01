@@ -3,6 +3,7 @@ import fcntl
 import importlib.util
 import io
 import json
+import math
 import os
 import random
 import select
@@ -52,6 +53,38 @@ def audio(symbols, amplitude=1800, noise=0, duration=.16, gap=.12, lead=0):
             samples.append(int(value))
         samples.extend(int(rng.uniform(-noise, noise)) for _ in range(int(RATE * gap)))
     return struct.pack('<' + str(len(samples)) + 'h', *samples)
+
+
+def telephone_audio(symbols, noise=1000, twist=.45, lead=0, seed=17):
+    import math
+    rng = random.Random(seed)
+    samples = [0.0] * int(lead * RATE)
+    for symbol in symbols:
+        low, high = FREQUENCIES[symbol]
+        offset = len(samples)
+        for index in range(800):
+            n = offset + index
+            envelope = min(1, index / 70, (799 - index) / 70)
+            samples.append(envelope * (1250 * math.sin(2 * math.pi * low * 1.003 * n / RATE) +
+                                       1250 * twist * math.sin(2 * math.pi * high * 1.003 * n / RATE)) +
+                           1000 * math.sin(2 * math.pi * 440 * n / RATE) + rng.uniform(-noise, noise))
+        offset = len(samples)
+        for index in range(640):
+            n = offset + index
+            samples.append(1000 * math.sin(2 * math.pi * 440 * n / RATE) + rng.uniform(-noise, noise))
+    lowpass = highpass = previous_lowpass = 0.0
+    output = []
+    log_mu = math.log1p(255)
+    for sample in samples:
+        lowpass += .73 * (sample - lowpass)
+        highpass = .81 * (highpass + lowpass - previous_lowpass)
+        previous_lowpass = lowpass
+        scaled = max(-1, min(1, highpass / 32768))
+        encoded = math.copysign(math.log1p(255 * abs(scaled)) / log_mu, scaled)
+        encoded = round((encoded + 1) * 127.5) / 127.5 - 1
+        decoded = math.copysign(math.expm1(log_mu * abs(encoded)) / 255, encoded)
+        output.append(int(max(-32768, min(32767, decoded * 32768))))
+    return struct.pack('<' + str(len(output)) + 'h', *output)
 
 
 def collect_bytes(data, length, pipe_size=None):
@@ -267,6 +300,42 @@ class PolicyTests(unittest.TestCase):
 
 
 class AudioTests(unittest.TestCase):
+    def test_telephone_degradation_preserves_complete_sequence(self):
+        for noise, twist in ((1000, .45), (2000, .6), (2500, 1)):
+            for lead in (0, .005, .015):
+                with self.subTest(noise=noise, twist=twist, lead=lead):
+                    data = telephone_audio('12#2', noise=noise, twist=twist, lead=lead)
+                    self.assertEqual(collect_bytes(data, 4), '12#2')
+        with patch('inbound_call_eagi.MIN_TONE_POWER_RATIO', 26):
+            with self.assertRaises(CallEnded):
+                collect_bytes(telephone_audio('12#2', noise=1000, twist=.45), 4)
+
+    def test_telephone_degradation_does_not_complete_on_partial_or_fake_audio(self):
+        with self.assertRaises(CallEnded):
+            collect_bytes(telephone_audio('12#', noise=2000, twist=.6), 4)
+        rng = random.Random(41)
+        for kind in ('white', 'correlated', 'speech', 'near_tones'):
+            history = 0.0
+            samples = []
+            for index in range(RATE * 5):
+                if kind == 'white':
+                    value = rng.uniform(-4000, 4000)
+                elif kind == 'correlated':
+                    history = .94 * history + rng.uniform(-800, 800)
+                    value = history
+                elif kind == 'speech':
+                    envelope = .5 + .5 * math.sin(2 * math.pi * 4 * index / RATE)
+                    value = envelope * (2200 * math.sin(2 * math.pi * 440 * index / RATE) +
+                                        1000 * math.sin(2 * math.pi * 880 * index / RATE) +
+                                        600 * math.sin(2 * math.pi * 1760 * index / RATE)) + rng.uniform(-1300, 1300)
+                else:
+                    value = (1600 * math.sin(2 * math.pi * 730 * index / RATE) +
+                             1600 * math.sin(2 * math.pi * 1270 * index / RATE) + rng.uniform(-300, 300))
+                samples.append(int(max(-32768, min(32767, value))))
+            fake = struct.pack('<' + str(len(samples)) + 'h', *samples)
+            with self.subTest(kind=kind), self.assertRaises(CallEnded):
+                collect_bytes(fake, 1)
+
     def test_eighty_ms_tones_and_gaps_at_frame_offsets(self):
         for lead in (0, .005, .01, .015, .02, .025, .035):
             with self.subTest(lead=lead):
