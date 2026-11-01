@@ -1,0 +1,252 @@
+"""Per-SIM incoming call policy shared by the Bot and Asterisk EAGI."""
+import copy
+import fcntl
+import hashlib
+import hmac
+import json
+import math
+import os
+import re
+import secrets
+import stat
+import tempfile
+import time
+from contextlib import contextmanager
+from pathlib import Path
+
+
+SIM_ID = re.compile(r'(?:iccid:[0-9]{18,22}|imsi:[0-9]{14,16})\Z')
+DEVICE_ID = re.compile(r'quectel[0-9]{1,2}\Z')
+SUBSCRIBER = re.compile(r'\+[1-9][0-9]{6,14}\Z')
+DTMF = re.compile(r'[0-9*#ABCD]+\Z')
+CALLER = re.compile(r'021[0-9]{7,8}\Z')
+MODES = ('forward', 'direct', 'protected')
+DEFAULT_PATH = '/var/lib/asterisk-telegram-bot/inbound-call.json'
+
+
+class PolicyWriteUncertain(OSError):
+    pass
+
+
+def sim_identities(metadata):
+    if not isinstance(metadata, dict):
+        return ()
+    identities = []
+    for field in ('iccid', 'imsi'):
+        value = metadata.get(field)
+        if value is not None and value != '':
+            if not isinstance(value, str) or not SIM_ID.fullmatch(field + ':' + value):
+                return ()
+            identities.append(field + ':' + value)
+    return tuple(identities)
+
+
+def subscriber_number(value):
+    if not isinstance(value, str):
+        return None
+    number = re.sub(r'[\s()-]', '', value)
+    return number if SUBSCRIBER.fullmatch(number) else None
+
+
+def parse_live_line_state(output, device):
+    if not DEVICE_ID.fullmatch(device) or not isinstance(output, str) or len(output) > 65536:
+        raise ValueError('device state')
+    fields = {}
+    lines = output.splitlines()
+    if not lines or 'Status' not in lines[0]:
+        raise ValueError('device state')
+    for line in lines[1:]:
+        if ':' not in line:
+            continue
+        key, value = line.split(':', 1)
+        key = key.strip().lower()
+        if key in fields:
+            raise ValueError('duplicate device field')
+        fields[key] = value.strip()
+    if fields.get('device') != device:
+        raise ValueError('device changed')
+    number = subscriber_number(fields.get('subscriber number')) or ''
+    identities = sim_identities({'iccid': fields.get('iccid'), 'imsi': fields.get('imsi')})
+    state = fields.get('state', '')
+    inactive = not number and not identities and state in ('Stopped', 'Not connected', 'Not initialized')
+    selectable = bool(number and identities and state and state not in ('Stopped', 'Not connected', 'Not initialized'))
+    return {'device': device, 'number': number, 'identities': identities, 'inactive': inactive, 'selectable': selectable}
+
+
+def normalize_caller(value):
+    if not isinstance(value, str):
+        return None
+    number = re.sub(r'[\s()-]', '', value)
+    if number.startswith('+86'):
+        number = number[3:]
+        if number.startswith('21'):
+            number = '0' + number
+    elif number.startswith('0086'):
+        number = number[4:]
+        if number.startswith('21'):
+            number = '0' + number
+    return number if CALLER.fullmatch(number) else None
+
+
+class InboundCallPolicy:
+    def __init__(self, path=DEFAULT_PATH, clock=time.time):
+        self.path = Path(path)
+        self.clock = clock
+
+    def load(self):
+        try:
+            fd = os.open(self.path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(fd) as stream:
+                details = os.fstat(stream.fileno())
+                if not stat.S_ISREG(details.st_mode) or details.st_size > 65536 or details.st_mode & 0o777 != 0o640:
+                    return None
+                data = json.load(stream)
+            if not isinstance(data, dict) or data.get('version') != 1 or not isinstance(data.get('sims'), dict) or len(data['sims']) > 20:
+                return None
+            for sim, item in data['sims'].items():
+                if not SIM_ID.fullmatch(sim) or not isinstance(item, dict) or set(item) != {'mode', 'salt', 'digest', 'length', 'volume', 'test_until', 'number'}:
+                    return None
+                if not isinstance(item['number'], str) or (item['number'] and not SUBSCRIBER.fullmatch(item['number'])):
+                    return None
+                if item['mode'] not in MODES or type(item['length']) is not int or item['length'] < 0:
+                    return None
+                if type(item['volume']) is not int or not 1 <= item['volume'] <= 30:
+                    return None
+                if type(item['test_until']) not in (int, float) or not math.isfinite(item['test_until']) or item['test_until'] < 0:
+                    return None
+                if not isinstance(item['salt'], str) or not isinstance(item['digest'], str):
+                    return None
+                if item['salt'] or item['digest']:
+                    if not (isinstance(item['salt'], str) and isinstance(item['digest'], str) and
+                            re.fullmatch(r'[0-9a-f]{32}', item['salt']) and re.fullmatch(r'[0-9a-f]{64}', item['digest']) and item['length'] > 0):
+                        return None
+                elif item['length']:
+                    return None
+            return data
+        except (OSError, ValueError, TypeError):
+            return None
+
+    def snapshot(self, identities, caller):
+        state = self.load()
+        if state is None:
+            return None
+        if isinstance(identities, str):
+            identities = (identities,)
+        matches = [sim for sim in identities if sim in state['sims']]
+        if len(matches) != 1:
+            return None
+        item = state['sims'][matches[0]]
+        if item['mode'] == 'forward':
+            return None
+        if item['mode'] == 'protected' and not item['digest']:
+            return None
+        if self.clock() >= item['test_until'] and normalize_caller(caller) is None:
+            return None
+        return copy.deepcopy(item)
+
+    def update(self, sim, field, value, number=None):
+        if not SIM_ID.fullmatch(sim):
+            raise ValueError('SIM identity')
+        self._check_directory()
+        with self._writer_lock():
+            return self._update_locked(sim, field, value, number)
+
+    def update_for_identities(self, identities, field, value, number):
+        if (not isinstance(identities, tuple) or not identities or len(identities) > 2 or
+                len(set(identities)) != len(identities) or any(not SIM_ID.fullmatch(sim) for sim in identities) or
+                not isinstance(number, str) or not SUBSCRIBER.fullmatch(number)):
+            raise ValueError('line identity')
+        self._check_directory()
+        with self._writer_lock():
+            state = self.load()
+            if state is None and self.path.exists():
+                raise ValueError('policy file')
+            matches = [sim for sim in identities if state is not None and sim in state['sims']]
+            if len(matches) > 1:
+                raise ValueError('identity conflict')
+            if state is not None and any(item['number'] == number for sim, item in state['sims'].items() if sim not in identities):
+                raise ValueError('number reassigned')
+            sim = matches[0] if matches else identities[0]
+            return self._update_locked(sim, field, value, number)
+
+    @contextmanager
+    def _writer_lock(self):
+        fd = os.open(str(self.path) + '.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode) or os.fstat(fd).st_mode & 0o077:
+                raise PermissionError('policy lock permissions')
+            deadline = time.monotonic() + 3
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('policy writer busy')
+                    time.sleep(.01)
+            yield
+        finally:
+            os.close(fd)
+
+    def _update_locked(self, sim, field, value, number=None):
+        state = self.load()
+        if state is None:
+            if self.path.exists():
+                raise ValueError('policy file')
+            state = {'version': 1, 'sims': {}}
+        state = copy.deepcopy(state)
+        if sim not in state['sims'] and len(state['sims']) >= 20:
+            raise ValueError('SIM capacity')
+        item = state['sims'].setdefault(sim, {'mode': 'forward', 'salt': '', 'digest': '', 'length': 0, 'volume': 10, 'test_until': 0, 'number': ''})
+        if number is not None:
+            if not SUBSCRIBER.fullmatch(number):
+                raise ValueError('subscriber number')
+            item['number'] = number
+        if field == 'mode' and value in MODES:
+            if value == 'protected' and not item['digest']:
+                raise ValueError('secret required')
+            item['mode'] = value
+        elif field == 'secret' and isinstance(value, str) and DTMF.fullmatch(value):
+            salt = secrets.token_bytes(16)
+            item.update(salt=salt.hex(), digest=hashlib.pbkdf2_hmac('sha256', value.encode(), salt, 200000).hex(), length=len(value))
+        elif field == 'volume' and isinstance(value, int) and 1 <= value <= 30:
+            item['volume'] = value
+        elif field == 'test' and isinstance(value, int) and 0 <= value <= 900:
+            item['test_until'] = self.clock() + value if value else 0
+        else:
+            raise ValueError('policy setting')
+        fd, temporary = tempfile.mkstemp(prefix='.inbound-call-', dir=self.path.parent)
+        replaced = False
+        try:
+            with os.fdopen(fd, 'w') as stream:
+                json.dump(state, stream, separators=(',', ':'))
+                stream.flush()
+                os.fchmod(stream.fileno(), 0o640)
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+            replaced = True
+            directory = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError as exc:
+            if replaced:
+                raise PolicyWriteUncertain('policy durability') from exc
+            raise
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+        return item
+
+    def _check_directory(self):
+        directory_mode = self.path.parent.stat().st_mode
+        if not (directory_mode & stat.S_ISGID) or directory_mode & 0o077 != 0o050:
+            raise PermissionError('policy directory permissions')
+
+
+def matches_secret(item, symbols):
+    if len(symbols) != item['length'] or not DTMF.fullmatch(symbols):
+        return False
+    candidate = hashlib.pbkdf2_hmac('sha256', symbols.encode(), bytes.fromhex(item['salt']), 200000)
+    return hmac.compare_digest(candidate, bytes.fromhex(item['digest']))
