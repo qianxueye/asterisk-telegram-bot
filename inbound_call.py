@@ -16,6 +16,8 @@ from pathlib import Path
 
 
 SIM_ID = re.compile(r'(?:iccid:[0-9]{18,22}|imsi:[0-9]{14,16})\Z')
+DEVICE_ID = re.compile(r'quectel[0-9]{1,2}\Z')
+SUBSCRIBER = re.compile(r'\+[1-9][0-9]{6,14}\Z')
 DTMF = re.compile(r'[0-9*#ABCD]+\Z')
 CALLER = re.compile(r'021[0-9]{7,8}\Z')
 MODES = ('forward', 'direct', 'protected')
@@ -37,6 +39,38 @@ def sim_identities(metadata):
                 return ()
             identities.append(field + ':' + value)
     return tuple(identities)
+
+
+def subscriber_number(value):
+    if not isinstance(value, str):
+        return None
+    number = re.sub(r'[\s()-]', '', value)
+    return number if SUBSCRIBER.fullmatch(number) else None
+
+
+def parse_live_line_state(output, device):
+    if not DEVICE_ID.fullmatch(device) or not isinstance(output, str) or len(output) > 65536:
+        raise ValueError('device state')
+    fields = {}
+    lines = output.splitlines()
+    if not lines or 'Status' not in lines[0]:
+        raise ValueError('device state')
+    for line in lines[1:]:
+        if ':' not in line:
+            continue
+        key, value = line.split(':', 1)
+        key = key.strip().lower()
+        if key in fields:
+            raise ValueError('duplicate device field')
+        fields[key] = value.strip()
+    if fields.get('device') != device:
+        raise ValueError('device changed')
+    number = subscriber_number(fields.get('subscriber number')) or ''
+    identities = sim_identities({'iccid': fields.get('iccid'), 'imsi': fields.get('imsi')})
+    state = fields.get('state', '')
+    inactive = not number and not identities and state in ('Stopped', 'Not connected', 'Not initialized')
+    selectable = bool(number and identities and state and state not in ('Stopped', 'Not connected', 'Not initialized'))
+    return {'device': device, 'number': number, 'identities': identities, 'inactive': inactive, 'selectable': selectable}
 
 
 def normalize_caller(value):
@@ -66,7 +100,9 @@ class InboundCallPolicy:
             if not isinstance(data, dict) or data.get('version') != 1 or not isinstance(data.get('sims'), dict) or len(data['sims']) > 20:
                 return None
             for sim, item in data['sims'].items():
-                if not SIM_ID.fullmatch(sim) or not isinstance(item, dict) or set(item) != {'mode', 'salt', 'digest', 'length', 'volume', 'test_until'}:
+                if not SIM_ID.fullmatch(sim) or not isinstance(item, dict) or set(item) != {'mode', 'salt', 'digest', 'length', 'volume', 'test_until', 'number'}:
+                    return None
+                if not isinstance(item['number'], str) or (item['number'] and not SUBSCRIBER.fullmatch(item['number'])):
                     return None
                 if item['mode'] not in MODES or type(item['length']) is not int or item['length'] < 0:
                     return None
@@ -104,12 +140,30 @@ class InboundCallPolicy:
             return None
         return copy.deepcopy(item)
 
-    def update(self, sim, field, value):
+    def update(self, sim, field, value, number=None):
         if not SIM_ID.fullmatch(sim):
             raise ValueError('SIM identity')
         self._check_directory()
         with self._writer_lock():
-            return self._update_locked(sim, field, value)
+            return self._update_locked(sim, field, value, number)
+
+    def update_for_identities(self, identities, field, value, number):
+        if (not isinstance(identities, tuple) or not identities or len(identities) > 2 or
+                len(set(identities)) != len(identities) or any(not SIM_ID.fullmatch(sim) for sim in identities) or
+                not isinstance(number, str) or not SUBSCRIBER.fullmatch(number)):
+            raise ValueError('line identity')
+        self._check_directory()
+        with self._writer_lock():
+            state = self.load()
+            if state is None and self.path.exists():
+                raise ValueError('policy file')
+            matches = [sim for sim in identities if state is not None and sim in state['sims']]
+            if len(matches) > 1:
+                raise ValueError('identity conflict')
+            if state is not None and any(item['number'] == number for sim, item in state['sims'].items() if sim not in identities):
+                raise ValueError('number reassigned')
+            sim = matches[0] if matches else identities[0]
+            return self._update_locked(sim, field, value, number)
 
     @contextmanager
     def _writer_lock(self):
@@ -130,7 +184,7 @@ class InboundCallPolicy:
         finally:
             os.close(fd)
 
-    def _update_locked(self, sim, field, value):
+    def _update_locked(self, sim, field, value, number=None):
         state = self.load()
         if state is None:
             if self.path.exists():
@@ -139,7 +193,11 @@ class InboundCallPolicy:
         state = copy.deepcopy(state)
         if sim not in state['sims'] and len(state['sims']) >= 20:
             raise ValueError('SIM capacity')
-        item = state['sims'].setdefault(sim, {'mode': 'forward', 'salt': '', 'digest': '', 'length': 0, 'volume': 10, 'test_until': 0})
+        item = state['sims'].setdefault(sim, {'mode': 'forward', 'salt': '', 'digest': '', 'length': 0, 'volume': 10, 'test_until': 0, 'number': ''})
+        if number is not None:
+            if not SUBSCRIBER.fullmatch(number):
+                raise ValueError('subscriber number')
+            item['number'] = number
         if field == 'mode' and value in MODES:
             if value == 'protected' and not item['digest']:
                 raise ValueError('secret required')

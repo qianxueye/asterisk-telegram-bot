@@ -28,7 +28,7 @@ from telethon.tl.types import UpdateNewMessage, Message
 from telethon.tl.custom import Button
 from config import Config
 from sms_guard import SmsFloodGuard, DEVICE
-from inbound_call import InboundCallPolicy, PolicyWriteUncertain, SIM_ID
+from inbound_call import InboundCallPolicy, PolicyWriteUncertain, SIM_ID, DEVICE_ID, parse_live_line_state, subscriber_number
 
 
 class AsteriskBot:
@@ -39,7 +39,7 @@ class AsteriskBot:
         ('device_statistics', '查看设备统计'), ('recover_numbers', '恢复设备本机号码'),
         ('uac_recover', '检查与恢复 UAC 音频'), ('pending_sms', '查看待确认发送记录'),
         ('sms_notifications', '设置短信发送通知'), ('sms_guard', '短信防护'),
-        ('inbound_call', '设置指定 SIM 的来电处理'),
+        ('inbound_call', '按本机号码设置来电处理'),
         ('add_user', '添加授权用户'), ('remove_user', '移除授权用户'),
         ('test_sms_log', '测试短信日志解析'), ('check_sms_logs', '查看近期短信日志'),
     )
@@ -3094,6 +3094,26 @@ class AsteriskBot:
         kind, dropped = transition
         self.queue_sms_item({'notice': kind, 'device_id': device, 'dropped': dropped})
 
+    async def read_inbound_lines(self):
+        async def scan_once():
+            output = await self.execute_asterisk_cli('quectel show devices')
+            if not isinstance(output, str) or len(output) > 65536:
+                raise ValueError('line scan')
+            rows = output.splitlines()
+            if not rows or rows[0].split()[:2] != ['ID', 'Group']:
+                raise ValueError('line scan')
+            devices = [row.split()[0] for row in rows[1:] if row.split()]
+            if len(devices) > 4 or len(set(devices)) != len(devices) or any(not DEVICE_ID.fullmatch(device) for device in devices):
+                raise ValueError('line scan')
+            states = await asyncio.gather(*(self.execute_asterisk_cli(f'quectel show device state {device}') for device in devices))
+            return [parse_live_line_state(state, device) for device, state in zip(devices, states)]
+
+        first = await scan_once()
+        second = await scan_once()
+        if first != second:
+            raise ValueError('line changed')
+        return second
+
     async def handle_inbound_call_command(self, chat_id, text, user_id):
         if not Config.is_authorized(user_id):
             return
@@ -3112,22 +3132,68 @@ class AsteriskBot:
                 lines = ['来电处理']
                 for sim, item in sorted(state['sims'].items()):
                     remaining = max(0, int(item['test_until'] - self.inbound_call.clock()))
-                    line = f"{sim[:sim.index(':')]} 尾号 {sim[-4:]}：{labels[item['mode']]}，口令回放音量 {item['volume']}%"
+                    name = f"上次选择 {item['number']}" if item['number'] else f"{sim[:sim.index(':')]} 尾号 {sim[-4:]}"
+                    line = f"{name}（SIM 尾号 {sim[-4:]}）：{labels[item['mode']]}，口令回放音量 {item['volume']}%"
                     line += f'，测试：开启（剩余 {remaining} 秒）' if remaining else '，测试：关闭'
                     lines.append(line)
                 await self.send_message(chat_id, '\n'.join(lines), parse_mode=None)
                 return
-            if len(parts) != 4 or not SIM_ID.fullmatch(parts[2]):
+            if len(parts) == 2 and parts[1] == 'lines':
+                lines = await self.read_inbound_lines()
+                policy = self.inbound_call.load()
+                if policy is None and self.inbound_call.path.exists():
+                    raise ValueError('policy file')
+                message = ['当前本机号码']
+                available = False
+                if not lines:
+                    message.append('未发现设备。请检查 /devices。')
+                for line in lines:
+                    if line['inactive']:
+                        message.append(f"{line['device']}：设备未连接或未就绪，暂不可设置。")
+                    elif not line['number']:
+                        message.append(f"{line['device']}：本机号码未读取。请检查 /device_state。")
+                    elif not line['identities']:
+                        message.append(f"{line['number']}：SIM 身份未读取，暂不可设置。请检查 /device_state。")
+                    elif not line['selectable']:
+                        message.append(f"{line['number']}：设备状态未就绪，暂不可设置。")
+                    elif sum(other['number'] == line['number'] for other in lines) > 1 or any(
+                            set(line['identities']) & set(other['identities']) for other in lines if other is not line):
+                        message.append(f"{line['number']}：号码或 SIM 身份重复，暂不可设置。")
+                    elif policy and sum(identity in policy['sims'] for identity in line['identities']) > 1:
+                        message.append(f"{line['number']}：该 SIM 有重复的身份设置，暂不可设置。")
+                    elif policy and any(item['number'] == line['number'] for sim, item in policy['sims'].items()
+                                        if sim not in line['identities']):
+                        message.append(f"{line['number']}：号码已关联另一张 SIM，暂不可设置。")
+                    elif any(not other['number'] or not other['identities'] for other in lines if other is not line and not other['inactive']):
+                        message.append(f"{line['number']}：其他设备状态不完整，暂不可设置。")
+                    else:
+                        message.append(f"{line['number']}：可设置。")
+                        available = True
+                message.append('发送 /inbound_call mode +本机号码 forward|direct|protected。' if available else
+                               '请检查 /devices 和 /device_state，等本机号码与 SIM 身份可用后重试。')
+                await self.send_message(chat_id, '\n'.join(message), parse_mode=None)
+                return
+            if len(parts) != 4:
                 raise ValueError('usage')
-            action, sim, value = parts[1:]
-            if action == 'mode':
-                self.inbound_call.update(sim, action, value)
-            elif action == 'secret':
-                self.inbound_call.update(sim, action, value)
-            elif action in ('volume', 'test'):
-                self.inbound_call.update(sim, action, int(value))
+            action, selector, value = parts[1:]
+            if action not in ('mode', 'secret', 'volume', 'test'):
+                raise ValueError('usage')
+            if action in ('volume', 'test'):
+                value = int(value)
+            if SIM_ID.fullmatch(selector):
+                self.inbound_call.update(selector, action, value)
             else:
-                raise ValueError('usage')
+                number = subscriber_number(selector)
+                if not number:
+                    raise ValueError('usage')
+                lines = await self.read_inbound_lines()
+                matches = [line for line in lines if line['number'] == number]
+                if len(matches) != 1 or not matches[0]['selectable'] or any(
+                        (not line['number'] or not line['identities']) and not line['inactive'] for line in lines):
+                    raise ValueError('line unavailable')
+                if any(set(matches[0]['identities']) & set(line['identities']) for line in lines if line is not matches[0]):
+                    raise ValueError('line unavailable')
+                self.inbound_call.update_for_identities(matches[0]['identities'], action, value, number)
         except PolicyWriteUncertain:
             await self.send_message(chat_id, '保存过程没有返回结果。请先查询 /inbound_call status；口令可重新设置。', parse_mode=None)
             return
@@ -3138,10 +3204,25 @@ class AsteriskBot:
             if isinstance(exc, ValueError) and str(exc) == 'secret required':
                 await self.send_message(chat_id, '请先设置该 SIM 的口令，再启用口令应答。', parse_mode=None)
                 return
+            if isinstance(exc, ValueError) and str(exc) in ('line scan', 'device state', 'duplicate device field', 'device changed', 'line changed'):
+                await self.send_message(chat_id, '设备状态读取失败，设置未保存。请检查 /devices 和 /device_state 后重试。', parse_mode=None)
+                return
+            if isinstance(exc, ValueError) and str(exc) == 'line unavailable':
+                await self.send_message(chat_id, '本机号码或 SIM 身份未读取，或存在重复；设置未保存。请检查 /inbound_call lines。', parse_mode=None)
+                return
+            if isinstance(exc, ValueError) and str(exc) == 'identity conflict':
+                await self.send_message(chat_id, '该 SIM 有重复的身份设置，设置未保存。请联系管理员处理。', parse_mode=None)
+                return
+            if isinstance(exc, ValueError) and str(exc) == 'number reassigned':
+                await self.send_message(chat_id, '该号码已关联另一张 SIM，设置未保存。请联系管理员核对旧设置。', parse_mode=None)
+                return
+            if isinstance(exc, ValueError) and str(exc) == 'policy file':
+                await self.send_message(chat_id, '来电设置读取失败，暂无法按号码设置。请联系管理员检查。', parse_mode=None)
+                return
             await self.send_message(chat_id,
-                '设置未保存。用法：/inbound_call mode iccid:号码 forward|direct|protected；'
-                '/inbound_call secret iccid:号码 口令；/inbound_call volume iccid:号码 1-30；'
-                '/inbound_call test iccid:号码 秒数（0-900）；/inbound_call status。也可使用 imsi:号码。',
+                '设置未保存。先发 /inbound_call lines 查看本机号码；再发 /inbound_call mode +本机号码 forward|direct|protected、'
+                '/inbound_call secret +本机号码 口令、/inbound_call volume +本机号码 1-30、'
+                '/inbound_call test +本机号码 秒数（0-900）。也可使用完整 iccid: 或 imsi: 身份。',
                 parse_mode=None)
             return
         await self.send_message(chat_id, '设置已保存。', parse_mode=None)

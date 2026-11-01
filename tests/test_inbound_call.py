@@ -14,13 +14,27 @@ import wave
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from inbound_call import InboundCallPolicy, PolicyWriteUncertain, matches_secret, normalize_caller, sim_identities
+from inbound_call import InboundCallPolicy, PolicyWriteUncertain, matches_secret, normalize_caller, parse_live_line_state, sim_identities, subscriber_number
 from inbound_call_eagi import CallEnded, FREQUENCIES, RATE, ToneCollector, _write_replay, collect, handle_call
 
 
 SIM = 'iccid:12345678901234567890'
 OTHER = 'iccid:22345678901234567890'
 IMSI = 'imsi:123456789012345'
+PHONE = '+8613800138000'
+
+
+def device_state(device, phone=PHONE, sim=SIM, imsi=IMSI, state='Free'):
+    return (f'-------------- Status -------------\n  Device : {device}\n'
+            f'  State : {state}\n'
+            f'  ICCID : {sim.split(":", 1)[1] if sim else ""}\n'
+            f'  IMSI : {imsi.split(":", 1)[1] if imsi else ""}\n'
+            f'  Subscriber Number : {phone}\n')
+
+
+def device_rows(*devices):
+    return 'ID Group State RSSI Mode Provider Name Model Firmware Number\n' + ''.join(
+        f'{device} 0 Start 20 0 Provider Model Firmware\n' for device in devices)
 
 
 def audio(symbols, amplitude=1800, noise=0, duration=.16, gap=.12):
@@ -71,6 +85,23 @@ class PolicyTests(unittest.TestCase):
         for value in ('021123456', '021123456789', '021123456x', '+1 0211234567', '8610211234567', '0211234567#'):
             self.assertIsNone(normalize_caller(value))
 
+    def test_live_line_state_requires_matching_device_and_valid_identity(self):
+        self.assertEqual(subscriber_number('+86 (138) 0013-8000'), PHONE)
+        self.assertIsNone(subscriber_number('13800138000'))
+        line = parse_live_line_state(device_state('quectel0'), 'quectel0')
+        self.assertEqual((line['number'], line['identities']), (PHONE, (SIM, IMSI)))
+        self.assertEqual(parse_live_line_state(device_state('quectel0', phone='Unknown'), 'quectel0')['number'], '')
+        self.assertEqual(parse_live_line_state(device_state('quectel0', sim='', imsi=''), 'quectel0')['identities'], ())
+        self.assertTrue(parse_live_line_state(device_state('quectel1', phone='Unknown', sim='', imsi='',
+                                                           state='Not initialized'), 'quectel1')['inactive'])
+        self.assertFalse(parse_live_line_state(device_state('quectel1', phone='Unknown', sim='', imsi='',
+                                                            state='Free'), 'quectel1')['inactive'])
+        self.assertFalse(parse_live_line_state(device_state('quectel0', state='Stopped'), 'quectel0')['selectable'])
+        with self.assertRaises(ValueError):
+            parse_live_line_state(device_state('quectel1'), 'quectel0')
+        with self.assertRaises(ValueError):
+            parse_live_line_state(device_state('quectel0') + '  ICCID : 123\n', 'quectel0')
+
     def test_default_off_exact_sim_test_expiry_and_snapshot(self):
         self.assertIsNone(self.policy.snapshot(SIM, '0211234567'))
         self.policy.update(SIM, 'mode', 'direct')
@@ -97,6 +128,23 @@ class PolicyTests(unittest.TestCase):
         self.assertIsNone(self.policy.snapshot(identities, '0211234567'))
         self.policy.update(OTHER, 'mode', 'direct')
         self.assertIsNone(self.policy.snapshot((OTHER, IMSI), '0211234567'))
+
+    def test_number_binding_reuses_existing_identity_and_rejects_conflict(self):
+        self.policy.update(IMSI, 'mode', 'forward')
+        self.policy.update_for_identities((SIM, IMSI), 'mode', 'direct', PHONE)
+        state = self.policy.load()['sims']
+        self.assertEqual(list(state), [IMSI])
+        self.assertEqual((state[IMSI]['number'], state[IMSI]['mode']), (PHONE, 'direct'))
+        self.policy.update(SIM, 'mode', 'forward')
+        with self.assertRaisesRegex(ValueError, 'identity conflict'):
+            self.policy.update_for_identities((SIM, IMSI), 'mode', 'direct', PHONE)
+        self.assertEqual(self.policy.load()['sims'][IMSI]['mode'], 'direct')
+
+    def test_number_reassignment_does_not_create_a_second_sim_policy(self):
+        self.policy.update_for_identities((SIM, IMSI), 'mode', 'direct', PHONE)
+        with self.assertRaisesRegex(ValueError, 'number reassigned'):
+            self.policy.update_for_identities((OTHER, 'imsi:223456789012345'), 'mode', 'direct', PHONE)
+        self.assertEqual(list(self.policy.load()['sims']), [SIM])
 
     def test_secret_hash_permissions_and_fail_safe_config(self):
         self.policy.update(SIM, 'secret', '12#*')
@@ -338,7 +386,8 @@ class EagiTests(unittest.TestCase):
 
 
 class BotTests(unittest.IsolatedAsyncioTestCase):
-    async def test_authorization_setting_and_no_secret_in_reply(self):
+    @staticmethod
+    def bot_classes():
         import sys
         modules = {}
         for name in ('telethon', 'telethon.tl', 'telethon.tl.functions',
@@ -358,8 +407,10 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                                                         Path(__file__).resolve().parents[1] / 'asterisk_bot.py')
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
-            AsteriskBot = module.AsteriskBot
-            Config = module.Config
+            return module.AsteriskBot, module.Config
+
+    async def test_authorization_setting_and_no_secret_in_reply(self):
+        AsteriskBot, Config = self.bot_classes()
         with tempfile.TemporaryDirectory() as directory:
             bot = AsteriskBot.__new__(AsteriskBot)
             bot.inbound_call = InboundCallPolicy(Path(directory) / 'state.json', clock=lambda: 1000)
@@ -380,6 +431,125 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             for call in bot.send_message.call_args_list:
                 self.assertNotIn('12#', str(call))
             self.assertIn('inbound_call', [name for name, _ in AsteriskBot.COMMANDS])
+
+    async def test_phone_selection_revalidates_line_and_survives_slot_swap(self):
+        AsteriskBot, Config = self.bot_classes()
+        with tempfile.TemporaryDirectory() as directory:
+            bot = AsteriskBot.__new__(AsteriskBot)
+            bot.inbound_call = InboundCallPolicy(Path(directory) / 'state.json', clock=lambda: 1000)
+            bot.send_message = AsyncMock()
+            bot.execute_command = AsyncMock()
+            bot.execute_asterisk_cli = AsyncMock(side_effect=[
+                device_rows('quectel0', 'quectel1'), device_state('quectel0'),
+                device_state('quectel1', 'Unknown', '', '', 'Not initialized'),
+                device_rows('quectel0', 'quectel1'), device_state('quectel0'),
+                device_state('quectel1', 'Unknown', '', '', 'Not initialized')])
+            with patch.object(Config, 'AUTHORIZED_USERS', {1}), patch.object(InboundCallPolicy, '_check_directory'):
+                await bot.handle_inbound_call_command(1, '/inbound_call lines', 2)
+                bot.execute_asterisk_cli.assert_not_awaited()
+                await bot.handle_inbound_call_command(1, '/inbound_call mode ' + PHONE + ' direct', 1)
+                state = bot.inbound_call.load()['sims']
+                self.assertEqual(list(state), [SIM])
+                self.assertEqual((state[SIM]['number'], state[SIM]['mode']), (PHONE, 'direct'))
+                self.assertEqual(bot.execute_asterisk_cli.await_count, 6)
+                self.assertTrue(all(call.args[0] == 'quectel show devices' or
+                                    call.args[0] in ('quectel show device state quectel0', 'quectel show device state quectel1')
+                                    for call in bot.execute_asterisk_cli.await_args_list))
+                bot.execute_command.assert_not_awaited()
+                bot.execute_asterisk_cli = AsyncMock(side_effect=[
+                    device_rows('quectel0', 'quectel1'),
+                    device_state('quectel0', 'Unknown', '', '', 'Not initialized'),
+                    device_state('quectel1'),
+                    device_rows('quectel0', 'quectel1'),
+                    device_state('quectel0', 'Unknown', '', '', 'Not initialized'),
+                    device_state('quectel1')])
+                await bot.handle_inbound_call_command(1, '/inbound_call test ' + PHONE + ' 30', 1)
+                self.assertEqual(list(bot.inbound_call.load()['sims']), [SIM])
+                self.assertEqual(bot.inbound_call.load()['sims'][SIM]['test_until'], 1030)
+                await bot.handle_inbound_call_command(1, '/inbound_call status', 1)
+                self.assertIn(PHONE, bot.send_message.call_args.args[1])
+                bot.execute_asterisk_cli = AsyncMock(side_effect=[
+                    device_rows('quectel0', 'quectel1'), device_state('quectel0', 'Unknown', '', '', 'Not initialized'),
+                    device_state('quectel1'),
+                    device_rows('quectel0', 'quectel1'), device_state('quectel0', 'Unknown', '', '', 'Not initialized'),
+                    device_state('quectel1')])
+                await bot.handle_inbound_call_command(1, '/inbound_call lines', 1)
+                self.assertIn(PHONE + '：可设置', bot.send_message.call_args.args[1])
+                self.assertIn('quectel0：设备未连接或未就绪', bot.send_message.call_args.args[1])
+
+    async def test_two_distinct_phone_lines_keep_separate_sim_policies(self):
+        AsteriskBot, Config = self.bot_classes()
+        second_phone = '+8613900139000'
+        second_imsi = 'imsi:223456789012345'
+        scan = [device_rows('quectel0', 'quectel1'), device_state('quectel0'),
+                device_state('quectel1', second_phone, OTHER, second_imsi),
+                device_rows('quectel0', 'quectel1'), device_state('quectel0'),
+                device_state('quectel1', second_phone, OTHER, second_imsi)]
+        with tempfile.TemporaryDirectory() as directory:
+            bot = AsteriskBot.__new__(AsteriskBot)
+            bot.inbound_call = InboundCallPolicy(Path(directory) / 'state.json')
+            bot.send_message = AsyncMock()
+            bot.execute_asterisk_cli = AsyncMock(side_effect=scan * 2)
+            with patch.object(Config, 'AUTHORIZED_USERS', {1}), patch.object(InboundCallPolicy, '_check_directory'):
+                await bot.handle_inbound_call_command(1, '/inbound_call mode ' + PHONE + ' direct', 1)
+                await bot.handle_inbound_call_command(1, '/inbound_call mode ' + second_phone + ' forward', 1)
+            sims = bot.inbound_call.load()['sims']
+            self.assertEqual(set(sims), {SIM, OTHER})
+            self.assertEqual((sims[SIM]['number'], sims[SIM]['mode']), (PHONE, 'direct'))
+            self.assertEqual((sims[OTHER]['number'], sims[OTHER]['mode']), (second_phone, 'forward'))
+
+    async def test_phone_selection_rejects_unknown_duplicate_incomplete_and_changed_state(self):
+        AsteriskBot, Config = self.bot_classes()
+        cases = [
+            ('unknown', [device_rows('quectel0'), device_state('quectel0'),
+                         device_rows('quectel0'), device_state('quectel0')], '+8613700137000'),
+            ('duplicate', [device_rows('quectel0', 'quectel1'), device_state('quectel0'),
+                           device_state('quectel1', PHONE, OTHER, 'imsi:223456789012345'),
+                           device_rows('quectel0', 'quectel1'), device_state('quectel0'),
+                           device_state('quectel1', PHONE, OTHER, 'imsi:223456789012345')], PHONE),
+            ('missing identity', [device_rows('quectel0'), device_state('quectel0', sim='', imsi=''),
+                                  device_rows('quectel0'), device_state('quectel0', sim='', imsi='')], PHONE),
+            ('missing number', [device_rows('quectel0', 'quectel1'), device_state('quectel0'),
+                                device_state('quectel1', 'Unknown', OTHER, 'imsi:223456789012345'),
+                                device_rows('quectel0', 'quectel1'), device_state('quectel0'),
+                                device_state('quectel1', 'Unknown', OTHER, 'imsi:223456789012345')], PHONE),
+            ('changed', [device_rows('quectel0'), device_state('quectel0'),
+                         device_rows('quectel0'), device_state('quectel0', '+8613900139000')], PHONE),
+            ('wrong device', [device_rows('quectel0'), device_state('quectel1'),
+                              device_rows('quectel0'), device_state('quectel1')], PHONE),
+            ('cli error', ['Command failed'], PHONE),
+            ('duplicate identity', [device_rows('quectel0', 'quectel1'), device_state('quectel0'),
+                                    device_state('quectel1', '+8613900139000'),
+                                    device_rows('quectel0', 'quectel1'), device_state('quectel0'),
+                                    device_state('quectel1', '+8613900139000')], PHONE),
+            ('stopped selected', [device_rows('quectel0'), device_state('quectel0', state='Stopped'),
+                                  device_rows('quectel0'), device_state('quectel0', state='Stopped')], PHONE),
+        ]
+        for name, responses, selected in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                bot = AsteriskBot.__new__(AsteriskBot)
+                bot.inbound_call = InboundCallPolicy(Path(directory) / 'state.json')
+                bot.send_message = AsyncMock()
+                bot.execute_asterisk_cli = AsyncMock(side_effect=responses)
+                with patch.object(Config, 'AUTHORIZED_USERS', {1}), patch.object(InboundCallPolicy, '_check_directory'):
+                    await bot.handle_inbound_call_command(1, '/inbound_call mode ' + selected + ' direct', 1)
+                self.assertFalse(bot.inbound_call.path.exists())
+                self.assertIn('设置未保存', bot.send_message.call_args.args[1])
+
+    async def test_line_list_does_not_offer_selection_with_invalid_policy(self):
+        AsteriskBot, Config = self.bot_classes()
+        with tempfile.TemporaryDirectory() as directory:
+            bot = AsteriskBot.__new__(AsteriskBot)
+            bot.inbound_call = InboundCallPolicy(Path(directory) / 'state.json')
+            bot.inbound_call.path.write_text('invalid')
+            bot.inbound_call.path.chmod(0o640)
+            bot.send_message = AsyncMock()
+            bot.execute_asterisk_cli = AsyncMock(side_effect=[device_rows('quectel0'), device_state('quectel0'),
+                                                              device_rows('quectel0'), device_state('quectel0')])
+            with patch.object(Config, 'AUTHORIZED_USERS', {1}):
+                await bot.handle_inbound_call_command(1, '/inbound_call lines', 1)
+            self.assertIn('暂无法按号码设置', bot.send_message.call_args.args[1])
+            self.assertEqual(bot.inbound_call.path.read_text(), 'invalid')
 
 
 if __name__ == '__main__':
