@@ -1,24 +1,17 @@
-import asyncio
-import fcntl
 import importlib.util
 import io
 import json
-import math
 import os
-import random
-import select
-import struct
 import tempfile
 import threading
 import time
 import types
 import unittest
-import wave
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from inbound_call import InboundCallPolicy, PolicyWriteUncertain, matches_secret, normalize_caller, parse_live_line_state, sim_identities, subscriber_number
-from inbound_call_eagi import CallEnded, FREQUENCIES, RATE, ToneCollector, _write_replay, collect, handle_call
+from inbound_call import InboundCallPolicy, PolicyWriteUncertain, normalize_caller, parse_live_line_state, sim_identities, subscriber_number
+from inbound_call_agi import handle_call
 
 
 SIM = 'iccid:12345678901234567890'
@@ -38,91 +31,6 @@ def device_state(device, phone=PHONE, sim=SIM, imsi=IMSI, state='Free'):
 def device_rows(*devices):
     return 'ID Group State RSSI Mode Provider Name Model Firmware Number\n' + ''.join(
         f'{device} 0 Start 20 0 Provider Model Firmware\n' for device in devices)
-
-
-def audio(symbols, amplitude=1800, noise=0, duration=.16, gap=.12, lead=0):
-    import math
-    rng = random.Random(42)
-    samples = [0] * int(RATE * lead)
-    for symbol in symbols:
-        low, high = FREQUENCIES[symbol]
-        for index in range(int(RATE * duration)):
-            value = amplitude * (math.sin(2 * math.pi * low * index / RATE) +
-                                 math.sin(2 * math.pi * high * index / RATE))
-            value += rng.uniform(-noise, noise)
-            samples.append(int(value))
-        samples.extend(int(rng.uniform(-noise, noise)) for _ in range(int(RATE * gap)))
-    return struct.pack('<' + str(len(samples)) + 'h', *samples)
-
-
-def telephone_audio(symbols, noise=1000, twist=.45, lead=0, seed=17):
-    import math
-    rng = random.Random(seed)
-    samples = [0.0] * int(lead * RATE)
-    for symbol in symbols:
-        low, high = FREQUENCIES[symbol]
-        offset = len(samples)
-        for index in range(800):
-            n = offset + index
-            envelope = min(1, index / 70, (799 - index) / 70)
-            samples.append(envelope * (1250 * math.sin(2 * math.pi * low * 1.003 * n / RATE) +
-                                       1250 * twist * math.sin(2 * math.pi * high * 1.003 * n / RATE)) +
-                           1000 * math.sin(2 * math.pi * 440 * n / RATE) + rng.uniform(-noise, noise))
-        offset = len(samples)
-        for index in range(640):
-            n = offset + index
-            samples.append(1000 * math.sin(2 * math.pi * 440 * n / RATE) + rng.uniform(-noise, noise))
-    lowpass = highpass = previous_lowpass = 0.0
-    output = []
-    log_mu = math.log1p(255)
-    for sample in samples:
-        lowpass += .73 * (sample - lowpass)
-        highpass = .81 * (highpass + lowpass - previous_lowpass)
-        previous_lowpass = lowpass
-        scaled = max(-1, min(1, highpass / 32768))
-        encoded = math.copysign(math.log1p(255 * abs(scaled)) / log_mu, scaled)
-        encoded = round((encoded + 1) * 127.5) / 127.5 - 1
-        decoded = math.copysign(math.expm1(log_mu * abs(encoded)) / 255, encoded)
-        output.append(int(max(-32768, min(32767, decoded * 32768))))
-    return struct.pack('<' + str(len(output)) + 'h', *output)
-
-
-def collect_bytes(data, length, pipe_size=None):
-    read, write = os.pipe()
-    if pipe_size is not None and hasattr(fcntl, 'F_SETPIPE_SZ'):
-        fcntl.fcntl(write, fcntl.F_SETPIPE_SZ, pipe_size)
-        assert fcntl.fcntl(write, fcntl.F_GETPIPE_SZ) <= pipe_size
-    errors = []
-    stopped = threading.Event()
-    os.set_blocking(write, False)
-    def produce():
-        try:
-            offset = 0
-            while offset < len(data) and not stopped.is_set():
-                if not select.select([], [write], [], .05)[1]:
-                    continue
-                try:
-                    offset += os.write(write, data[offset:offset + 2048])
-                except BlockingIOError:
-                    continue
-        except BrokenPipeError:
-            pass
-        except Exception as exc:
-            errors.append(exc)
-        finally:
-            os.close(write)
-    worker = threading.Thread(target=produce)
-    worker.start()
-    try:
-        return collect(read, length, timeout=2)
-    finally:
-        stopped.set()
-        os.close(read)
-        worker.join(timeout=2)
-        if worker.is_alive():
-            raise AssertionError('audio producer did not stop')
-        if errors:
-            raise errors[0]
 
 
 class PolicyTests(unittest.TestCase):
@@ -211,33 +119,42 @@ class PolicyTests(unittest.TestCase):
             self.policy.update_for_identities((OTHER, 'imsi:223456789012345'), 'mode', 'direct', PHONE)
         self.assertEqual(list(self.policy.load()['sims']), [SIM])
 
-    def test_secret_hash_permissions_and_fail_safe_config(self):
-        self.policy.update(SIM, 'secret', '12#*')
-        self.policy.update(SIM, 'mode', 'protected')
-        item = self.policy.snapshot(SIM, '0211234567')
-        self.assertTrue(matches_secret(item, '12#*'))
-        self.assertFalse(matches_secret(item, '12#0'))
-        self.assertFalse(matches_secret(item, '12#'))
-        self.assertNotIn('12#*', self.policy.path.read_text())
+    def test_removed_settings_rejected_and_fail_safe_config(self):
+        for field, value in (('secret', '12#*'), ('volume', 10), ('mode', 'protected')):
+            with self.assertRaises(ValueError):
+                self.policy.update(SIM, field, value)
+        self.policy.update(SIM, 'mode', 'direct')
+        self.assertEqual(set(self.policy.load()['sims'][SIM]), {'mode', 'test_until', 'number'})
         self.assertEqual(self.policy.path.stat().st_mode & 0o777, 0o640)
         self.policy.path.write_text('{bad')
         self.assertIsNone(self.policy.snapshot(SIM, '0211234567'))
         with self.assertRaises(ValueError):
             self.policy.update(SIM, 'mode', 'direct')
 
-    def test_no_arbitrary_secret_length_limit(self):
-        self.policy.update(SIM, 'secret', '12#' * 100)
-        self.policy.update(SIM, 'mode', 'protected')
-        item = self.policy.snapshot(SIM, '0211234567')
-        self.assertEqual(item['length'], 300)
-        self.assertTrue(matches_secret(item, '12#' * 100))
+    def test_legacy_policy_migration_strips_secret_and_disables_protected(self):
+        legacy = {'version': 1, 'sims': {
+            SIM: {'mode': 'protected', 'salt': 'a' * 32, 'digest': 'b' * 64, 'length': 4,
+                  'volume': 10, 'test_until': 1030, 'number': PHONE},
+            OTHER: {'mode': 'direct', 'salt': '', 'digest': '', 'length': 0,
+                    'volume': 10, 'test_until': 0, 'number': ''}}}
+        self.policy.path.write_text(json.dumps(legacy))
+        os.chmod(self.policy.path, 0o640)
+        self.assertIsNone(self.policy.snapshot(SIM, '0211234567'))
+        self.assertEqual(self.policy.snapshot(OTHER, '0211234567')['mode'], 'direct')
+        self.policy.migrate_legacy()
+        stored = json.loads(self.policy.path.read_text())
+        self.assertEqual(stored['version'], 2)
+        self.assertEqual(stored['sims'][SIM], {'mode': 'forward', 'test_until': 1030, 'number': PHONE})
+        self.assertEqual(stored['sims'][OTHER]['mode'], 'direct')
+        self.assertNotIn('digest', self.policy.path.read_text())
+        self.assertNotIn('salt', self.policy.path.read_text())
 
     def test_reader_observes_atomic_snapshots_during_updates(self):
         self.policy.update(SIM, 'mode', 'direct')
         errors = []
         def writer():
             for value in range(1, 31):
-                self.policy.update(SIM, 'volume', value)
+                self.policy.update(SIM, 'test', value)
         worker = threading.Thread(target=writer)
         worker.start()
         while worker.is_alive():
@@ -245,7 +162,7 @@ class PolicyTests(unittest.TestCase):
                 errors.append('invalid snapshot')
         worker.join()
         self.assertEqual(errors, [])
-        self.assertEqual(self.policy.load()['sims'][SIM]['volume'], 30)
+        self.assertEqual(self.policy.load()['sims'][SIM]['test_until'], 1030)
 
     def test_concurrent_writers_keep_both_changes(self):
         self.policy.update(SIM, 'mode', 'forward')
@@ -264,7 +181,7 @@ class PolicyTests(unittest.TestCase):
                 errors.append(type(exc).__name__)
         with patch.object(self.policy, 'load', side_effect=slow_load):
             first = threading.Thread(target=change, args=('mode', 'direct'))
-            second = threading.Thread(target=change, args=('volume', 22))
+            second = threading.Thread(target=change, args=('test', 22))
             first.start()
             second.start()
             start.wait()
@@ -272,7 +189,7 @@ class PolicyTests(unittest.TestCase):
             second.join()
         self.assertEqual(errors, [])
         item = self.policy.load()['sims'][SIM]
-        self.assertEqual((item['mode'], item['volume']), ('direct', 22))
+        self.assertEqual((item['mode'], item['test_until']), ('direct', 1022))
         self.assertEqual(os.stat(str(self.policy.path) + '.lock').st_mode & 0o777, 0o600)
 
     def test_directory_sync_failure_reports_uncertain_result(self):
@@ -294,184 +211,12 @@ class PolicyTests(unittest.TestCase):
         self.assertIsNone(self.policy.load())
         self.policy.path.unlink()
         target = Path(self.temp.name) / 'other.json'
-        target.write_text('{"version":1,"sims":{}}')
+        target.write_text('{"version":2,"sims":{}}')
         self.policy.path.symlink_to(target)
         self.assertIsNone(self.policy.load())
 
 
-class AudioTests(unittest.TestCase):
-    def test_quiet_telephone_tones_decode_without_noise_false_hits(self):
-        for expected in ('2580', '2581'):
-            with self.subTest(expected=expected):
-                signal = telephone_audio(expected, noise=1000, twist=.45)
-                samples = struct.unpack('<' + str(len(signal) // 2) + 'h', signal)
-                quiet = struct.pack('<' + str(len(samples)) + 'h', *(round(sample * .02) for sample in samples))
-                self.assertEqual(collect_bytes(quiet, 4), expected)
-                with patch('inbound_call_eagi.MIN_WINDOW_ENERGY', 320 * 110 ** 2):
-                    with self.assertRaises(CallEnded):
-                        collect_bytes(quiet, 4)
-
-        rng = random.Random(52)
-        noise = struct.pack('<120000h', *(rng.randrange(-40, 41) for _ in range(RATE * 15)))
-        with self.assertRaises(CallEnded):
-            collect_bytes(noise, 1)
-
-    def test_four_window_tone_cluster_and_repeated_digit_boundary(self):
-        detector = ToneCollector()
-        with patch('inbound_call_eagi.detect_tone', side_effect=['2'] * 4 + [None] * 5 + ['2'] * 4):
-            emitted = [detector.feed(b'') for _ in range(13)]
-        self.assertEqual([symbol for symbol in emitted if symbol], ['2', '2'])
-        detector = ToneCollector()
-        with patch('inbound_call_eagi.detect_tone', side_effect=['2'] * 3):
-            self.assertEqual([detector.feed(b'') for _ in range(3)], [None] * 3)
-
-    def test_mid_tone_erasure_does_not_duplicate_a_digit(self):
-        for lead in (0, .005, .015):
-            for at in (.03, .04, .05):
-                with self.subTest(lead=lead, at=at):
-                    signal = audio('2580', duration=.1, gap=.1, lead=lead)
-                    samples = list(struct.unpack('<' + str(len(signal) // 2) + 'h', signal))
-                    for digit in range(4):
-                        start = int((lead + digit * .2 + at) * RATE)
-                        samples[start:start + 240] = [0] * 240
-                    damaged = struct.pack('<' + str(len(samples)) + 'h', *samples)
-                    self.assertEqual(collect_bytes(damaged, 4), '2580')
-
-    def test_telephone_degradation_preserves_complete_sequence(self):
-        for noise, twist in ((1000, .45), (2000, .6), (2500, 1)):
-            for lead in (0, .005, .015):
-                with self.subTest(noise=noise, twist=twist, lead=lead):
-                    data = telephone_audio('12#2', noise=noise, twist=twist, lead=lead)
-                    self.assertEqual(collect_bytes(data, 4), '12#2')
-        with patch('inbound_call_eagi.MIN_TONE_POWER_RATIO', 26):
-            with self.assertRaises(CallEnded):
-                collect_bytes(telephone_audio('12#2', noise=1000, twist=.45), 4)
-
-    def test_telephone_degradation_does_not_complete_on_partial_or_fake_audio(self):
-        with self.assertRaises(CallEnded):
-            collect_bytes(telephone_audio('12#', noise=2000, twist=.6), 4)
-        rng = random.Random(41)
-        for kind in ('white', 'correlated', 'speech', 'near_tones'):
-            history = 0.0
-            samples = []
-            for index in range(RATE * 5):
-                if kind == 'white':
-                    value = rng.uniform(-4000, 4000)
-                elif kind == 'correlated':
-                    history = .94 * history + rng.uniform(-800, 800)
-                    value = history
-                elif kind == 'speech':
-                    envelope = .5 + .5 * math.sin(2 * math.pi * 4 * index / RATE)
-                    value = envelope * (2200 * math.sin(2 * math.pi * 440 * index / RATE) +
-                                        1000 * math.sin(2 * math.pi * 880 * index / RATE) +
-                                        600 * math.sin(2 * math.pi * 1760 * index / RATE)) + rng.uniform(-1300, 1300)
-                else:
-                    value = (1600 * math.sin(2 * math.pi * 730 * index / RATE) +
-                             1600 * math.sin(2 * math.pi * 1270 * index / RATE) + rng.uniform(-300, 300))
-                samples.append(int(max(-32768, min(32767, value))))
-            fake = struct.pack('<' + str(len(samples)) + 'h', *samples)
-            with self.subTest(kind=kind), self.assertRaises(CallEnded):
-                collect_bytes(fake, 1)
-
-    def test_eighty_ms_tones_and_gaps_at_frame_offsets(self):
-        for lead in (0, .005, .01, .015, .02, .025, .035):
-            with self.subTest(lead=lead):
-                self.assertEqual(collect_bytes(audio('11#2', duration=.08, gap=.08, lead=lead), 4), '11#2')
-                self.assertEqual(collect_bytes(audio('11#2', duration=.08, gap=.04, lead=lead), 4), '11#2')
-
-    def test_short_interruption_does_not_make_two_repeated_digits(self):
-        interrupted = (audio('1', duration=.2, gap=0) + b'\0' * (RATE * 2 // 50) +
-                       audio('1', duration=.2, gap=.08))
-        with self.assertRaises(CallEnded):
-            collect_bytes(interrupted, 2)
-
-    def test_noisy_low_level_and_repeated_digits(self):
-        self.assertEqual(collect_bytes(audio('12#2', amplitude=700, noise=250), 4), '12#2')
-        self.assertEqual(collect_bytes(audio('11', amplitude=1400, noise=100), 2), '11')
-
-    def test_noise_speech_like_wrong_frequency_and_partial_never_complete(self):
-        with self.assertRaises(CallEnded):
-            collect_bytes(audio('123', noise=100), 4)
-        rng = random.Random(12)
-        noise = struct.pack('<3200h', *(rng.randint(-1800, 1800) for _ in range(3200)))
-        detector = ToneCollector()
-        self.assertEqual([detector.feed(noise[i:i+640]) for i in range(0, len(noise), 640)], [None] * 10)
-        with self.assertRaises(CallEnded):
-            collect_bytes(audio('1', duration=.04), 1)
-
-    def test_speech_like_multifrequency_and_large_pipe_payload_do_not_complete(self):
-        import math
-        rng = random.Random(31)
-        samples = [int(1000 * math.sin(2 * math.pi * 440 * n / RATE) +
-                       700 * math.sin(2 * math.pi * 880 * n / RATE) +
-                       350 * math.sin(2 * math.pi * 1760 * n / RATE) +
-                       rng.uniform(-500, 500)) for n in range(RATE)]
-        fake = struct.pack('<' + str(len(samples)) + 'h', *samples)
-        with self.assertRaises(CallEnded):
-            collect_bytes(fake, 1, pipe_size=4096)
-        large = audio('1234', duration=.08, gap=.08) + fake * 8
-        self.assertGreater(len(large), 65536)
-        self.assertEqual(collect_bytes(large, 4, pipe_size=4096), '1234')
-
-    def test_collection_deadline_with_open_silent_pipe(self):
-        read, write = os.pipe()
-        try:
-            self.assertIsNone(collect(read, 1, timeout=.02))
-        finally:
-            os.close(read)
-            os.close(write)
-
-    def test_disconnect_and_private_replay_file(self):
-        read, write = os.pipe()
-        os.close(write)
-        with self.assertRaises(CallEnded):
-            collect(read, 1, timeout=.01)
-        os.close(read)
-        with tempfile.TemporaryDirectory() as directory:
-            path = _write_replay('12#', 10, directory)
-            self.assertNotIn('12#', path)
-            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
-            with wave.open(path, 'rb') as wav:
-                data = wav.readframes(wav.getnframes())
-            self.assertEqual(collect_bytes(data, 3), '12#')
-            low = _write_replay('1', 5, directory)
-            high = _write_replay('1', 30, directory)
-            with wave.open(low, 'rb') as wav:
-                quiet = struct.unpack('<' + str(wav.getnframes()) + 'h', wav.readframes(wav.getnframes()))
-            with wave.open(high, 'rb') as wav:
-                loud = struct.unpack('<' + str(wav.getnframes()) + 'h', wav.readframes(wav.getnframes()))
-            self.assertGreater(max(loud), max(quiet) * 5)
-
-    def test_stale_replay_disappearing_during_cleanup_is_benign(self):
-        with tempfile.TemporaryDirectory() as directory:
-            stale = Path(directory) / 'tone-stale.wav'
-            stale.write_bytes(b'old')
-            age = time.time() - 180
-            os.utime(stale, (age, age))
-            real_unlink = os.unlink
-            def raced_unlink(path):
-                if path == str(stale):
-                    real_unlink(path)
-                    raise FileNotFoundError(path)
-                real_unlink(path)
-            with patch('inbound_call_eagi.os.unlink', side_effect=raced_unlink):
-                fresh = _write_replay('1', 10, directory)
-            self.assertFalse(stale.exists())
-            self.assertTrue(Path(fresh).exists())
-            Path(fresh).unlink()
-
-    def test_stale_replay_cleanup_keeps_permission_error(self):
-        with tempfile.TemporaryDirectory() as directory:
-            stale = Path(directory) / 'tone-stale.wav'
-            stale.write_bytes(b'old')
-            age = time.time() - 180
-            os.utime(stale, (age, age))
-            with patch('inbound_call_eagi.os.unlink', side_effect=PermissionError('denied')):
-                with self.assertRaises(PermissionError):
-                    _write_replay('1', 10, directory)
-
-
-class EagiTests(unittest.TestCase):
+class AgiTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -479,8 +224,6 @@ class EagiTests(unittest.TestCase):
         checker.start()
         self.addCleanup(checker.stop)
         self.policy = InboundCallPolicy(Path(self.temp.name) / 'state.json', clock=lambda: 1000)
-        self.tone_dir = str(Path(self.temp.name) / 'tones')
-        os.mkdir(self.tone_dir, 0o700)
         self.policy.update(SIM, 'mode', 'direct')
 
     def run_call(self, metadata, caller, results='', policy=None, state='Ring'):
@@ -488,9 +231,8 @@ class EagiTests(unittest.TestCase):
                              '200 result=1 (' + state + ')\n'
                              '200 result=1 (' + caller + ')\n' + results)
         sink = io.StringIO()
-        with patch('inbound_call_eagi.time.sleep') as sleep:
-            outcome = handle_call(source, sink, policy=policy or self.policy, tone_dir=self.tone_dir)
-        return outcome, sink.getvalue(), sleep
+        outcome = handle_call(source, sink, policy=policy or self.policy)
+        return outcome, sink.getvalue(), None
 
     def test_forward_routes_do_not_answer(self):
         for metadata, caller in (({'name': 'quectel0'}, '0211234567'),
@@ -520,9 +262,19 @@ class EagiTests(unittest.TestCase):
         self.assertEqual(result, 'forward')
         self.assertNotIn('ANSWER', commands)
 
+    def test_legacy_protected_mode_follows_3cx_without_answer(self):
+        legacy = {'version': 1, 'sims': {SIM: {'mode': 'protected', 'salt': 'a' * 32,
+                  'digest': 'b' * 64, 'length': 4, 'volume': 10, 'test_until': 0, 'number': PHONE}}}
+        self.policy.path.write_text(json.dumps(legacy))
+        os.chmod(self.policy.path, 0o640)
+        result, commands, _ = self.run_call({'iccid': SIM.split(':')[1]}, '0211234567')
+        self.assertEqual(result, 'forward')
+        self.assertNotIn('ANSWER', commands)
+        self.assertNotIn('SendDTMF', commands)
+
     def test_direct_sends_three_fixed_digits_with_spacing(self):
         results = '200 result=0\n' * 4
-        outcome, commands, sleep = self.run_call({'iccid': SIM.split(':')[1]}, '0211234567', results)
+        outcome, commands, _ = self.run_call({'iccid': SIM.split(':')[1]}, '0211234567', results)
         self.assertEqual(outcome, 'sent')
         send_commands = [line for line in commands.splitlines() if line.startswith('EXEC SendDTMF ')]
         self.assertEqual(send_commands, ['EXEC SendDTMF ###,1500,100'])
@@ -535,7 +287,6 @@ class EagiTests(unittest.TestCase):
             starts.append(ends[-1] + gap)
             ends.append(starts[-1] + duration)
         self.assertEqual([start - end for start, end in zip(starts[1:], ends[:-1])], [1500, 1500])
-        sleep.assert_not_called()
         self.assertNotIn('HANGUP\n', commands)
 
     def test_direct_waits_for_senddtmf_completion_before_returning(self):
@@ -554,8 +305,7 @@ class EagiTests(unittest.TestCase):
                                '200 result=1 (Ring)\n200 result=1 (0211234567)\n' +
                                '200 result=0\n' * 4)
         result = []
-        worker = threading.Thread(target=lambda: result.append(handle_call(source, sink, policy=self.policy,
-                                                                            tone_dir=self.tone_dir)))
+        worker = threading.Thread(target=lambda: result.append(handle_call(source, sink, policy=self.policy)))
         worker.start()
         try:
             self.assertTrue(waiting.wait(2))
@@ -568,30 +318,7 @@ class EagiTests(unittest.TestCase):
         self.assertEqual(result, ['sent'])
         self.assertEqual(sink.getvalue().count('EXEC SendDTMF ###,1500,100'), 1)
 
-    def test_protected_full_mismatch_timeout_and_match(self):
-        self.policy.update(SIM, 'secret', '12#')
-        self.policy.update(SIM, 'mode', 'protected')
-        metadata = {'iccid': SIM.split(':')[1]}
-        with patch('inbound_call_eagi.collect', return_value=None):
-            result, commands, _ = self.run_call(metadata, '0211234567', '200 result=0\n' * 3)
-            self.assertEqual(result, 'timeout')
-            self.assertNotIn('SendDTMF', commands)
-        with patch('inbound_call_eagi.collect', return_value='12*'):
-            result, commands, _ = self.run_call(metadata, '0211234567', '200 result=0\n' * 4)
-            self.assertEqual(result, 'mismatch')
-            self.assertIn('STREAM FILE', commands)
-            self.assertNotIn('12*', commands)
-            self.assertNotIn('SendDTMF', commands)
-        with patch('inbound_call_eagi.collect', return_value='12#'):
-            result, commands, _ = self.run_call(metadata, '0211234567', '200 result=0\n' * 5)
-            self.assertEqual(result, 'sent')
-            self.assertEqual(commands.count('EXEC SendDTMF ###,1500,100'), 1)
-            self.assertNotIn('12#', commands)
-            result, commands, _ = self.run_call(metadata, '0211234567', '200 result=0\n' * 4 + '200 result=-1\n')
-            self.assertEqual(result, 'ended')
-            self.assertEqual(commands.count('EXEC SendDTMF ###,1500,100'), 1)
-
-    def test_selection_answer_disconnect_and_playback_failures(self):
+    def test_selection_answer_and_send_disconnect_failures(self):
         metadata = {'iccid': SIM.split(':')[1]}
         result, commands, _ = self.run_call(metadata, '0211234567', '200 result=-1\n')
         self.assertEqual(result, 'forward')
@@ -607,23 +334,12 @@ class EagiTests(unittest.TestCase):
         result, commands, _ = self.run_call(metadata, '0211234567', '200 result=0\n' * 3 + '200 result=-1\n')
         self.assertEqual(result, 'ended')
         self.assertEqual(commands.count('EXEC SendDTMF ###,1500,100'), 1)
-        self.policy.update(SIM, 'secret', '12#')
-        self.policy.update(SIM, 'mode', 'protected')
-        with patch('inbound_call_eagi.collect', side_effect=CallEnded):
-            result, commands, _ = self.run_call(metadata, '0211234567', '200 result=0\n' * 3)
-            self.assertEqual(result, 'ended')
-            self.assertNotIn('SendDTMF', commands)
-        with patch('inbound_call_eagi.collect', return_value='12#'):
-            result, commands, _ = self.run_call(metadata, '0211234567', '200 result=0\n' * 3 + '200 result=-1\n')
-            self.assertEqual(result, 'ended')
-            self.assertIn('STREAM FILE', commands)
-            self.assertNotIn('SendDTMF', commands)
-            self.assertEqual(os.listdir(self.tone_dir), [])
 
     def test_dialplan_preserves_existing_routes_and_answer_boundary(self):
         source = (Path(__file__).resolve().parents[1] / 'asterisk-dialplan-integrated.conf').read_text()
         mobile = source.split('[incoming-mobile]', 1)[1].split('[general-sms]', 1)[0]
-        self.assertLess(mobile.index('EAGI(inbound_call_eagi.py)'), mobile.index('Dial(PJSIP/${EXTEN}@10002)'))
+        self.assertLess(mobile.index('AGI(inbound_call_agi.py)'), mobile.index('Dial(PJSIP/${EXTEN}@10002)'))
+        self.assertNotIn('EAGI_AUDIO_FORMAT', mobile)
         self.assertIn('INBOUND_CALL_SELECTED', mobile)
         self.assertIn('CHANNEL(state)', mobile)
         self.assertIn('AGI(sms_ingress_agi.py)', mobile)
@@ -654,7 +370,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             spec.loader.exec_module(module)
             return module.AsteriskBot, module.Config
 
-    async def test_authorization_setting_and_no_secret_in_reply(self):
+    async def test_authorization_and_removed_modes(self):
         AsteriskBot, Config = self.bot_classes()
         with tempfile.TemporaryDirectory() as directory:
             bot = AsteriskBot.__new__(AsteriskBot)
@@ -664,15 +380,16 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
                 await bot.handle_inbound_call_command(2, '/inbound_call secret ' + SIM + ' 12#', 2)
                 self.assertFalse(bot.inbound_call.path.exists())
                 await bot.handle_inbound_call_command(1, '/inbound_call mode ' + SIM + ' protected', 1)
-                self.assertIn('请先设置', bot.send_message.call_args.args[1])
                 await bot.handle_inbound_call_command(1, '/inbound_call secret ' + SIM + ' 12#', 1)
-                await bot.handle_inbound_call_command(1, '/inbound_call mode ' + SIM + ' protected', 1)
+                await bot.handle_inbound_call_command(1, '/inbound_call volume ' + SIM + ' 10', 1)
+                self.assertFalse(bot.inbound_call.path.exists())
+                await bot.handle_inbound_call_command(1, '/inbound_call mode ' + SIM + ' direct', 1)
                 await bot.handle_inbound_call_command(1, '/inbound_call status', 1)
                 self.assertIn('测试：关闭', bot.send_message.call_args.args[1])
                 await bot.handle_inbound_call_command(1, '/inbound_call test ' + SIM + ' 30', 1)
                 await bot.handle_inbound_call_command(1, '/inbound_call status', 1)
                 self.assertIn('测试：开启', bot.send_message.call_args.args[1])
-            self.assertEqual(bot.inbound_call.load()['sims'][SIM]['mode'], 'protected')
+            self.assertEqual(bot.inbound_call.load()['sims'][SIM]['mode'], 'direct')
             for call in bot.send_message.call_args_list:
                 self.assertNotIn('12#', str(call))
             self.assertIn('inbound_call', [name for name, _ in AsteriskBot.COMMANDS])

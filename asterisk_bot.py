@@ -477,11 +477,6 @@ class AsteriskBot:
                 
                 # 检查用户状态
                 if text and text.split()[0].split('@')[0] == '/inbound_call':
-                    if text.split(maxsplit=2)[1:2] == ['secret']:
-                        try:
-                            await event.delete()
-                        except Exception:
-                            pass
                     await self.handle_inbound_call_command(chat_id, text, user_id)
                 elif text and text.split()[0].split('@')[0] == '/sms_guard':
                     await self.handle_sms_guard_command(chat_id, text, user_id)
@@ -3128,12 +3123,12 @@ class AsteriskBot:
                                and state is None else '来电处理未配置；来电照常转接 3CX。')
                     await self.send_message(chat_id, message, parse_mode=None)
                     return
-                labels = {'forward': '转接 3CX', 'direct': '直接应答', 'protected': '口令应答'}
+                labels = {'forward': '转接 3CX', 'direct': '应答并发送 ###'}
                 lines = ['来电处理']
                 for sim, item in sorted(state['sims'].items()):
                     remaining = max(0, int(item['test_until'] - self.inbound_call.clock()))
                     name = f"上次选择 {item['number']}" if item['number'] else f"{sim[:sim.index(':')]} 尾号 {sim[-4:]}"
-                    line = f"{name}（SIM 尾号 {sim[-4:]}）：{labels[item['mode']]}，口令回放音量 {item['volume']}%"
+                    line = f"{name}（SIM 尾号 {sim[-4:]}）：{labels[item['mode']]}"
                     line += f'，测试：开启（剩余 {remaining} 秒）' if remaining else '，测试：关闭'
                     lines.append(line)
                 await self.send_message(chat_id, '\n'.join(lines), parse_mode=None)
@@ -3169,16 +3164,16 @@ class AsteriskBot:
                     else:
                         message.append(f"{line['number']}：可设置。")
                         available = True
-                message.append('发送 /inbound_call mode +本机号码 forward|direct|protected。' if available else
+                message.append('发送 /inbound_call mode +本机号码 forward|direct。' if available else
                                '请检查 /devices 和 /device_state，等本机号码与 SIM 身份可用后重试。')
                 await self.send_message(chat_id, '\n'.join(message), parse_mode=None)
                 return
             if len(parts) != 4:
                 raise ValueError('usage')
             action, selector, value = parts[1:]
-            if action not in ('mode', 'secret', 'volume', 'test'):
+            if action not in ('mode', 'test'):
                 raise ValueError('usage')
-            if action in ('volume', 'test'):
+            if action == 'test':
                 value = int(value)
             if SIM_ID.fullmatch(selector):
                 self.inbound_call.update(selector, action, value)
@@ -3195,15 +3190,12 @@ class AsteriskBot:
                     raise ValueError('line unavailable')
                 self.inbound_call.update_for_identities(matches[0]['identities'], action, value, number)
         except PolicyWriteUncertain:
-            await self.send_message(chat_id, '保存过程没有返回结果。请先查询 /inbound_call status；口令可重新设置。', parse_mode=None)
+            await self.send_message(chat_id, '保存过程没有返回结果。请查询 /inbound_call status。', parse_mode=None)
             return
         except OSError:
             await self.send_message(chat_id, '来电设置未写入。请联系管理员检查保存目录。', parse_mode=None)
             return
         except (ValueError, TypeError) as exc:
-            if isinstance(exc, ValueError) and str(exc) == 'secret required':
-                await self.send_message(chat_id, '请先设置该 SIM 的口令，再启用口令应答。', parse_mode=None)
-                return
             if isinstance(exc, ValueError) and str(exc) in ('line scan', 'device state', 'duplicate device field', 'device changed', 'line changed'):
                 await self.send_message(chat_id, '设备状态读取失败，设置未保存。请检查 /devices 和 /device_state 后重试。', parse_mode=None)
                 return
@@ -3220,9 +3212,8 @@ class AsteriskBot:
                 await self.send_message(chat_id, '来电设置读取失败，暂无法按号码设置。请联系管理员检查。', parse_mode=None)
                 return
             await self.send_message(chat_id,
-                '设置未保存。先发 /inbound_call lines 查看本机号码；再发 /inbound_call mode +本机号码 forward|direct|protected、'
-                '/inbound_call secret +本机号码 口令、/inbound_call volume +本机号码 1-30、'
-                '/inbound_call test +本机号码 秒数（0-900）。也可使用完整 iccid: 或 imsi: 身份。',
+                '设置未保存。先发 /inbound_call lines 查看本机号码；再发 /inbound_call mode +本机号码 forward|direct，'
+                '或 /inbound_call test +本机号码 秒数（0-900）。也可使用完整 iccid: 或 imsi: 身份。',
                 parse_mode=None)
             return
         await self.send_message(chat_id, '设置已保存。', parse_mode=None)

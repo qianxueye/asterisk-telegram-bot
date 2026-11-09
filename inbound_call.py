@@ -1,13 +1,10 @@
-"""Per-SIM incoming call policy shared by the Bot and Asterisk EAGI."""
+"""Per-SIM incoming call policy shared by the Bot and Asterisk AGI."""
 import copy
 import fcntl
-import hashlib
-import hmac
 import json
 import math
 import os
 import re
-import secrets
 import stat
 import tempfile
 import time
@@ -18,9 +15,8 @@ from pathlib import Path
 SIM_ID = re.compile(r'(?:iccid:[0-9]{18,22}|imsi:[0-9]{14,16})\Z')
 DEVICE_ID = re.compile(r'quectel[0-9]{1,2}\Z')
 SUBSCRIBER = re.compile(r'\+[1-9][0-9]{6,14}\Z')
-DTMF = re.compile(r'[0-9*#ABCD]+\Z')
 CALLER = re.compile(r'021[0-9]{7,8}\Z')
-MODES = ('forward', 'direct', 'protected')
+MODES = ('forward', 'direct')
 DEFAULT_PATH = '/var/lib/asterisk-telegram-bot/inbound-call.json'
 
 
@@ -101,27 +97,33 @@ class InboundCallPolicy:
                 if not stat.S_ISREG(details.st_mode) or details.st_size > 65536 or details.st_mode & 0o777 != 0o640:
                     return None
                 data = json.load(stream)
-            if not isinstance(data, dict) or data.get('version') != 1 or not isinstance(data.get('sims'), dict) or len(data['sims']) > 20:
+            if not isinstance(data, dict) or data.get('version') not in (1, 2) or not isinstance(data.get('sims'), dict) or len(data['sims']) > 20:
                 return None
+            legacy = data['version'] == 1
             for sim, item in data['sims'].items():
-                if not SIM_ID.fullmatch(sim) or not isinstance(item, dict) or set(item) != {'mode', 'salt', 'digest', 'length', 'volume', 'test_until', 'number'}:
+                fields = {'mode', 'salt', 'digest', 'length', 'volume', 'test_until', 'number'} if legacy else {'mode', 'test_until', 'number'}
+                if not SIM_ID.fullmatch(sim) or not isinstance(item, dict) or set(item) != fields:
                     return None
                 if not isinstance(item['number'], str) or (item['number'] and not SUBSCRIBER.fullmatch(item['number'])):
                     return None
-                if item['mode'] not in MODES or type(item['length']) is not int or item['length'] < 0:
-                    return None
-                if type(item['volume']) is not int or not 1 <= item['volume'] <= 30:
+                if item['mode'] not in (MODES + ('protected',) if legacy else MODES):
                     return None
                 if type(item['test_until']) not in (int, float) or not math.isfinite(item['test_until']) or item['test_until'] < 0:
                     return None
-                if not isinstance(item['salt'], str) or not isinstance(item['digest'], str):
-                    return None
-                if item['salt'] or item['digest']:
-                    if not (isinstance(item['salt'], str) and isinstance(item['digest'], str) and
-                            re.fullmatch(r'[0-9a-f]{32}', item['salt']) and re.fullmatch(r'[0-9a-f]{64}', item['digest']) and item['length'] > 0):
+                if legacy:
+                    if (type(item['length']) is not int or item['length'] < 0 or
+                            type(item['volume']) is not int or not 1 <= item['volume'] <= 30 or
+                            not isinstance(item['salt'], str) or not isinstance(item['digest'], str)):
                         return None
-                elif item['length']:
-                    return None
+                    if item['salt'] or item['digest']:
+                        if not (re.fullmatch(r'[0-9a-f]{32}', item['salt']) and
+                                re.fullmatch(r'[0-9a-f]{64}', item['digest']) and item['length'] > 0):
+                            return None
+                    elif item['length']:
+                        return None
+                    data['sims'][sim] = {'mode': 'forward' if item['mode'] == 'protected' else item['mode'],
+                                         'test_until': item['test_until'], 'number': item['number']}
+            data['version'] = 2
             return data
         except (OSError, ValueError, TypeError):
             return None
@@ -138,8 +140,6 @@ class InboundCallPolicy:
         item = state['sims'][matches[0]]
         if item['mode'] == 'forward':
             return None
-        if item['mode'] == 'protected' and not item['digest']:
-            return None
         if self.clock() >= item['test_until'] and normalize_caller(caller) is None:
             return None
         return copy.deepcopy(item)
@@ -150,6 +150,16 @@ class InboundCallPolicy:
         self._check_directory()
         with self._writer_lock():
             return self._update_locked(sim, field, value, number)
+
+    def migrate_legacy(self):
+        self._check_directory()
+        with self._writer_lock():
+            state = self.load()
+            if state is None:
+                if self.path.exists():
+                    raise ValueError('policy file')
+                return
+            self._save_state(state)
 
     def update_for_identities(self, identities, field, value, number):
         if (not isinstance(identities, tuple) or not identities or len(identities) > 2 or
@@ -193,28 +203,25 @@ class InboundCallPolicy:
         if state is None:
             if self.path.exists():
                 raise ValueError('policy file')
-            state = {'version': 1, 'sims': {}}
+            state = {'version': 2, 'sims': {}}
         state = copy.deepcopy(state)
         if sim not in state['sims'] and len(state['sims']) >= 20:
             raise ValueError('SIM capacity')
-        item = state['sims'].setdefault(sim, {'mode': 'forward', 'salt': '', 'digest': '', 'length': 0, 'volume': 10, 'test_until': 0, 'number': ''})
+        item = state['sims'].setdefault(sim, {'mode': 'forward', 'test_until': 0, 'number': ''})
         if number is not None:
             if not SUBSCRIBER.fullmatch(number):
                 raise ValueError('subscriber number')
             item['number'] = number
         if field == 'mode' and value in MODES:
-            if value == 'protected' and not item['digest']:
-                raise ValueError('secret required')
             item['mode'] = value
-        elif field == 'secret' and isinstance(value, str) and DTMF.fullmatch(value):
-            salt = secrets.token_bytes(16)
-            item.update(salt=salt.hex(), digest=hashlib.pbkdf2_hmac('sha256', value.encode(), salt, 200000).hex(), length=len(value))
-        elif field == 'volume' and isinstance(value, int) and 1 <= value <= 30:
-            item['volume'] = value
         elif field == 'test' and isinstance(value, int) and 0 <= value <= 900:
             item['test_until'] = self.clock() + value if value else 0
         else:
             raise ValueError('policy setting')
+        self._save_state(state)
+        return item
+
+    def _save_state(self, state):
         fd, temporary = tempfile.mkstemp(prefix='.inbound-call-', dir=self.path.parent)
         replaced = False
         try:
@@ -237,16 +244,8 @@ class InboundCallPolicy:
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
-        return item
 
     def _check_directory(self):
         directory_mode = self.path.parent.stat().st_mode
         if not (directory_mode & stat.S_ISGID) or directory_mode & 0o077 != 0o050:
             raise PermissionError('policy directory permissions')
-
-
-def matches_secret(item, symbols):
-    if len(symbols) != item['length'] or not DTMF.fullmatch(symbols):
-        return False
-    candidate = hashlib.pbkdf2_hmac('sha256', symbols.encode(), bytes.fromhex(item['salt']), 200000)
-    return hmac.compare_digest(candidate, bytes.fromhex(item['digest']))
