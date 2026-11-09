@@ -1,3 +1,4 @@
+import asyncio
 import importlib.util
 import io
 import json
@@ -226,13 +227,14 @@ class AgiTests(unittest.TestCase):
         self.policy = InboundCallPolicy(Path(self.temp.name) / 'state.json', clock=lambda: 1000)
         self.policy.update(SIM, 'mode', 'direct')
 
-    def run_call(self, metadata, caller, results='', policy=None, state='Ring'):
-        source = io.StringIO('agi_request: test\n\n200 result=1 (' + json.dumps(metadata) + ')\n'
+    def run_call(self, metadata, caller, results='', policy=None, state='Ring', pipe_response='200 result=1 (/private/tmp/sms)\n'):
+        source = io.StringIO('agi_request: test\nagi_uniqueid: 123.456\n\n200 result=1 (' + json.dumps(metadata) + ')\n'
                              '200 result=1 (' + state + ')\n'
-                             '200 result=1 (' + caller + ')\n' + results)
+                             '200 result=1 (' + caller + ')\n' + pipe_response + results)
         sink = io.StringIO()
-        outcome = handle_call(source, sink, policy=policy or self.policy)
-        return outcome, sink.getvalue(), None
+        with patch('inbound_call_agi.forward_event') as event:
+            outcome = handle_call(source, sink, policy=policy or self.policy)
+        return outcome, sink.getvalue(), event
 
     def test_forward_routes_do_not_answer(self):
         for metadata, caller in (({'name': 'quectel0'}, '0211234567'),
@@ -274,7 +276,7 @@ class AgiTests(unittest.TestCase):
 
     def test_direct_sends_three_fixed_digits_with_spacing(self):
         results = '200 result=0\n' * 4
-        outcome, commands, _ = self.run_call({'iccid': SIM.split(':')[1]}, '0211234567', results)
+        outcome, commands, event = self.run_call({'iccid': SIM.split(':')[1]}, '0211234567', results)
         self.assertEqual(outcome, 'sent')
         send_commands = [line for line in commands.splitlines() if line.startswith('EXEC SendDTMF ')]
         self.assertEqual(send_commands, ['EXEC SendDTMF ###,1500,100'])
@@ -288,6 +290,55 @@ class AgiTests(unittest.TestCase):
             ends.append(starts[-1] + duration)
         self.assertEqual([start - end for start, end in zip(starts[1:], ends[:-1])], [1500, 1500])
         self.assertNotIn('HANGUP\n', commands)
+        event.assert_called_once()
+        self.assertEqual(event.call_args.args[1], {'kind': 'inbound_call', 'event_id': '123.456',
+                          'sim_id': SIM, 'number': '', 'caller': '0211234567', 'status': 'accepted'})
+        self.assertEqual(event.call_args.kwargs['timeout'], .2)
+
+    def test_notification_failure_and_missing_pipe_do_not_change_call(self):
+        metadata = {'iccid': SIM.split(':')[1]}
+        for failure in (TimeoutError('no reader'), RuntimeError('transport failed')):
+            with patch('inbound_call_agi.forward_event', side_effect=failure) as event:
+                source = io.StringIO('agi_request: test\nagi_uniqueid: 123.456\n\n'
+                                     '200 result=1 (' + json.dumps(metadata) + ')\n'
+                                     '200 result=1 (Ring)\n200 result=1 (0211234567)\n'
+                                     '200 result=1 (/private/tmp/sms)\n' + '200 result=0\n' * 4)
+                sink = io.StringIO()
+                self.assertEqual(handle_call(source, sink, policy=self.policy), 'sent')
+                event.assert_called_once()
+                self.assertEqual(sink.getvalue().count('EXEC SendDTMF ###,1500,100'), 1)
+        result, commands, event = self.run_call(metadata, '0211234567', '200 result=0\n' * 4,
+                                                 pipe_response='200 result=0\n')
+        self.assertEqual(result, 'sent')
+        self.assertEqual(commands.count('EXEC SendDTMF ###,1500,100'), 1)
+        event.assert_not_called()
+
+    def test_send_failure_never_emits_success_notification(self):
+        result, commands, event = self.run_call({'iccid': SIM.split(':')[1]}, '0211234567',
+                                                 '200 result=0\n' * 3 + '200 result=-1\n')
+        self.assertEqual(result, 'ended')
+        self.assertEqual(commands.count('EXEC SendDTMF ###,1500,100'), 1)
+        event.assert_not_called()
+
+    def test_success_event_uses_existing_fifo_once(self):
+        pipe = str(Path(self.temp.name) / 'sms_pipe')
+        os.mkfifo(pipe, 0o600)
+        reader = os.open(pipe, os.O_RDONLY | os.O_NONBLOCK)
+        try:
+            source = io.StringIO('agi_request: test\nagi_uniqueid: 123.456\n\n'
+                                 '200 result=1 (' + json.dumps({'iccid': SIM.split(':')[1]}) + ')\n'
+                                 '200 result=1 (Ring)\n200 result=1 (0211234567)\n'
+                                 '200 result=1 (' + pipe + ')\n' + '200 result=0\n' * 4)
+            sink = io.StringIO()
+            self.assertEqual(handle_call(source, sink, policy=self.policy), 'sent')
+            raw = os.read(reader, 4096)
+            self.assertLess(len(raw), 4096)
+            records = [json.loads(line) for line in raw.splitlines() if line]
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]['event_id'], '123.456')
+            self.assertEqual(records[0]['status'], 'accepted')
+        finally:
+            os.close(reader)
 
     def test_direct_waits_for_senddtmf_completion_before_returning(self):
         sink = io.StringIO()
@@ -300,9 +351,10 @@ class AgiTests(unittest.TestCase):
                     if not resume.wait(2):
                         raise TimeoutError('SendDTMF response withheld')
                 return super().readline(*args)
-        source = WaitingSource('agi_request: test\n\n200 result=1 (' +
+        source = WaitingSource('agi_request: test\nagi_uniqueid: 123.456\n\n200 result=1 (' +
                                json.dumps({'iccid': SIM.split(':')[1]}) + ')\n'
-                               '200 result=1 (Ring)\n200 result=1 (0211234567)\n' +
+                               '200 result=1 (Ring)\n200 result=1 (0211234567)\n'
+                               '200 result=1 (/private/tmp/sms)\n' +
                                '200 result=0\n' * 4)
         result = []
         worker = threading.Thread(target=lambda: result.append(handle_call(source, sink, policy=self.policy)))
@@ -393,6 +445,68 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             for call in bot.send_message.call_args_list:
                 self.assertNotIn('12#', str(call))
             self.assertIn('inbound_call', [name for name, _ in AsteriskBot.COMMANDS])
+
+    async def test_call_event_delivery_is_authorized_validated_and_deduplicated(self):
+        AsteriskBot, Config = self.bot_classes()
+        bot = AsteriskBot.__new__(AsteriskBot)
+        bot.inbound_call_seen = {}
+        bot.sms_outbox = asyncio.Queue(maxsize=64)
+        bot.sms_queue_dropped = 0
+        bot.inbound_call_queue_dropped = 0
+        bot.send_message = AsyncMock(return_value=object())
+        event = {'kind': 'inbound_call', 'event_id': '123.456', 'sim_id': SIM,
+                 'number': PHONE, 'caller': '0211234567', 'status': 'accepted'}
+        with patch.object(Config, 'AUTHORIZED_USERS', {1, 2}):
+            await bot.process_sms_data(json.dumps(event))
+            await bot.process_sms_data(json.dumps(event))
+            self.assertEqual(bot.sms_outbox.qsize(), 1)
+            await bot.deliver_sms_item(bot.sms_outbox.get_nowait())
+        self.assertEqual([call.args[0] for call in bot.send_message.await_args_list], [1, 2])
+        for call in bot.send_message.await_args_list:
+            self.assertIn(PHONE, call.args[1])
+            self.assertIn('0211234567', call.args[1])
+            self.assertIn('Asterisk 已接受发送 ### 指令', call.args[1])
+            self.assertNotIn('已收到', call.args[1])
+            self.assertIsNone(call.kwargs['parse_mode'])
+
+    async def test_call_event_rejects_bad_fields_and_handles_full_queue(self):
+        AsteriskBot, _ = self.bot_classes()
+        bot = AsteriskBot.__new__(AsteriskBot)
+        bot.inbound_call_seen = {}
+        bot.sms_outbox = asyncio.Queue(maxsize=1)
+        bot.sms_queue_dropped = 0
+        bot.inbound_call_queue_dropped = 0
+        event = {'kind': 'inbound_call', 'event_id': '123.456', 'sim_id': SIM,
+                 'number': PHONE, 'caller': '', 'status': 'accepted'}
+        for key, value in (('sim_id', 'quectel0'), ('number', 'Unknown'), ('caller', '<html>'),
+                           ('status', 'delivered')):
+            invalid = dict(event, **{key: value})
+            with patch('builtins.print'):
+                await bot.process_sms_data(json.dumps(invalid))
+        self.assertTrue(bot.sms_outbox.empty())
+        bot.sms_outbox.put_nowait({'notice': 'start', 'device_id': 'quectel0'})
+        with patch('builtins.print'):
+            await bot.process_sms_data(json.dumps(event))
+        self.assertEqual(bot.inbound_call_queue_dropped, 1)
+        self.assertEqual(bot.sms_queue_dropped, 0)
+        self.assertNotIn(event['event_id'], bot.inbound_call_seen)
+        bot.sms_outbox.get_nowait()
+        await bot.process_sms_data(json.dumps(event))
+        self.assertEqual(bot.sms_outbox.qsize(), 1)
+        self.assertIn(event['event_id'], bot.inbound_call_seen)
+
+    async def test_call_event_without_number_omits_caller_and_delivery_error_isolated(self):
+        AsteriskBot, Config = self.bot_classes()
+        bot = AsteriskBot.__new__(AsteriskBot)
+        event = {'kind': 'inbound_call', 'event_id': '123.456', 'sim_id': SIM,
+                 'number': '', 'caller': '', 'status': 'accepted'}
+        bot.send_message = AsyncMock(side_effect=[ConnectionError('failed'), object()])
+        with patch.object(Config, 'AUTHORIZED_USERS', [1, 2]), patch('builtins.print'):
+            await bot.deliver_sms_item(event)
+        self.assertEqual(bot.send_message.await_count, 2)
+        for call in bot.send_message.await_args_list:
+            self.assertIn('SIM 尾号：7890', call.args[1])
+            self.assertNotIn('来电号码', call.args[1])
 
     async def test_phone_selection_revalidates_line_and_survives_slot_swap(self):
         AsteriskBot, Config = self.bot_classes()

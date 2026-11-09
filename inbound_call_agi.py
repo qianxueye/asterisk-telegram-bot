@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Answer selected mobile calls and send three fixed DTMF events."""
 import json
+import os
 import re
 import signal
 import sys
 
-from inbound_call import InboundCallPolicy, sim_identities
+from inbound_call import InboundCallPolicy, normalize_caller, sim_identities
+from sms_ingress_agi import forward as forward_event
 
 
 class CallEnded(Exception):
@@ -27,7 +29,7 @@ def agi(command, source=sys.stdin, sink=sys.stdout):
 
 
 def variable(name, source=sys.stdin, sink=sys.stdout):
-    if name not in ('QUECTEL', 'CALLERID(num)', 'CHANNEL(state)'):
+    if name not in ('QUECTEL', 'CALLERID(num)', 'CHANNEL(state)', 'SMS_PIPE'):
         raise ValueError('variable name')
     response = agi('GET FULL VARIABLE ${' + name + '}', source, sink)
     match = re.fullmatch(r'200 result=1 \((.*)\)\n', response)
@@ -37,12 +39,15 @@ def variable(name, source=sys.stdin, sink=sys.stdout):
 
 
 def handle_call(source=sys.stdin, sink=sys.stdout, policy=None):
+    call_id = ''
     for _ in range(100):
         line = source.readline(4096)
         if line == '\n':
             break
         if not line or len(line) >= 4096:
             return 'forward'
+        if line.startswith('agi_uniqueid: '):
+            call_id = line[len('agi_uniqueid: '):].strip()
     else:
         return 'forward'
     policy = policy or InboundCallPolicy()
@@ -56,8 +61,13 @@ def handle_call(source=sys.stdin, sink=sys.stdout, policy=None):
             caller = variable('CALLERID(num)', source, sink)
         except ValueError:
             caller = ''
-        if policy.snapshot(identities, caller) is None:
+        item = policy.snapshot(identities, caller)
+        if item is None:
             return 'forward'
+        try:
+            pipe = variable('SMS_PIPE', source, sink)
+        except ValueError:
+            pipe = ''
         agi('SET VARIABLE INBOUND_CALL_SELECTED 1', source, sink)
         agi('ANSWER', source, sink)
     except (OSError, ValueError, TypeError, CallEnded):
@@ -66,6 +76,16 @@ def handle_call(source=sys.stdin, sink=sys.stdout, policy=None):
     try:
         agi('SET AUTOHANGUP 60', source, sink)
         agi('EXEC SendDTMF ###,1500,100', source, sink)
+        if (re.fullmatch(r'/[A-Za-z0-9_./-]{1,255}', pipe) and os.path.normpath(pipe) == pipe and
+                re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', call_id)):
+            try:
+                forward_event(pipe, {'kind': 'inbound_call', 'event_id': call_id,
+                                     'sim_id': identities[0], 'number': item['number'],
+                                     'caller': normalize_caller(caller) or '', 'status': 'accepted'}, timeout=.2)
+            except CallEnded:
+                raise
+            except Exception:
+                pass
         return 'sent'
     except (OSError, ValueError, CallEnded):
         return 'ended'

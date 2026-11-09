@@ -28,7 +28,7 @@ from telethon.tl.types import UpdateNewMessage, Message
 from telethon.tl.custom import Button
 from config import Config
 from sms_guard import SmsFloodGuard, DEVICE
-from inbound_call import InboundCallPolicy, PolicyWriteUncertain, SIM_ID, DEVICE_ID, parse_live_line_state, subscriber_number
+from inbound_call import InboundCallPolicy, PolicyWriteUncertain, SIM_ID, DEVICE_ID, normalize_caller, parse_live_line_state, subscriber_number
 
 
 class AsteriskBot:
@@ -71,8 +71,10 @@ class AsteriskBot:
         self.uac_recovery_state = self.load_uac_recovery_state()
         self.sms_guard = SmsFloodGuard(os.getenv('SMS_GUARD_STATE_FILE', os.path.join(os.path.dirname(os.path.abspath(__file__)), '.sms_guard_state.json')))
         self.inbound_call = InboundCallPolicy()
+        self.inbound_call_seen = {}
         self.sms_outbox = asyncio.Queue(maxsize=64)
         self.sms_queue_dropped = 0
+        self.inbound_call_queue_dropped = 0
         self.background_tasks = []
         self.event_handlers_ready = False
         self.setup_sms_pipe()
@@ -3082,8 +3084,14 @@ class AsteriskBot:
     def queue_sms_item(self, item):
         try:
             self.sms_outbox.put_nowait(item)
+            return True
         except asyncio.QueueFull:
-            self.sms_queue_dropped += 1
+            if item.get('kind') == 'inbound_call':
+                self.inbound_call_queue_dropped += 1
+                print('来电通知队列已满，通知已丢弃')
+            else:
+                self.sms_queue_dropped += 1
+            return False
 
     def queue_guard_notice(self, device, transition):
         kind, dropped = transition
@@ -3252,6 +3260,9 @@ class AsteriskBot:
             info = json.loads(data)
             if not isinstance(info, dict):
                 raise ValueError('SMS envelope type')
+            if info.get('kind') == 'inbound_call':
+                self.process_inbound_call_event(info)
+                return
             device = info['device_id']
             sender = info.get('sender_number', '')
             content = info.get('content', '')
@@ -3274,9 +3285,37 @@ class AsteriskBot:
             self.queue_sms_item({'device_id': device, 'sender_number': sender,
                                  'content': content, 'timestamp': timestamp})
         except (ValueError, TypeError, KeyError, UnicodeError) as exc:
-            print('短信输入已丢弃：' + type(exc).__name__)
+            print('管道输入已丢弃：' + type(exc).__name__)
+
+    def process_inbound_call_event(self, info):
+        if set(info) != {'kind', 'event_id', 'sim_id', 'number', 'caller', 'status'} or info['status'] != 'accepted':
+            raise ValueError('call event fields')
+        event_id, sim_id = info['event_id'], info['sim_id']
+        number, caller = info['number'], info['caller']
+        if (not isinstance(event_id, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', event_id) or
+                not isinstance(sim_id, str) or not SIM_ID.fullmatch(sim_id) or
+                not isinstance(number, str) or (number and subscriber_number(number) != number) or
+                not isinstance(caller, str) or (caller and normalize_caller(caller) != caller)):
+            raise ValueError('call event identity')
+        if event_id in self.inbound_call_seen:
+            return
+        if self.queue_sms_item(info):
+            self.inbound_call_seen[event_id] = None
+            if len(self.inbound_call_seen) > 512:
+                del self.inbound_call_seen[next(iter(self.inbound_call_seen))]
 
     async def deliver_sms_item(self, info):
+        if info.get('kind') == 'inbound_call':
+            line = '设置的本机号码：' + info['number'] if info['number'] else 'SIM 尾号：' + info['sim_id'][-4:]
+            message = '来电自动处理：Asterisk 已接受发送 ### 指令。\n' + line
+            if info['caller']:
+                message += '\n来电号码：' + info['caller']
+            for user in Config.AUTHORIZED_USERS:
+                try:
+                    await self.send_message(user, message, parse_mode=None)
+                except Exception as exc:
+                    print('来电通知投递未确认：' + type(exc).__name__)
+            return
         if 'notice' in info:
             device = info['device_id']
             message = (f"{device} 短信防护已开启，后续验证码正文丢弃" if info['notice'] == 'start'
