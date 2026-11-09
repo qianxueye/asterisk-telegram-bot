@@ -507,6 +507,11 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         for call in bot.send_message.await_args_list:
             self.assertIn('SIM 尾号：7890', call.args[1])
             self.assertNotIn('来电号码', call.args[1])
+        bot.send_message = AsyncMock(return_value=None)
+        with patch.object(Config, 'AUTHORIZED_USERS', [1]), patch('builtins.print') as log:
+            await bot.deliver_sms_item(event)
+        bot.send_message.assert_awaited_once()
+        log.assert_called_once_with('来电通知投递未确认；未自动重发')
 
     async def test_phone_selection_revalidates_line_and_survives_slot_swap(self):
         AsteriskBot, Config = self.bot_classes()

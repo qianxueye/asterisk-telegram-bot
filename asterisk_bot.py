@@ -3312,7 +3312,8 @@ class AsteriskBot:
                 message += '\n来电号码：' + info['caller']
             for user in Config.AUTHORIZED_USERS:
                 try:
-                    await self.send_message(user, message, parse_mode=None)
+                    if await self.send_message(user, message, parse_mode=None) is None:
+                        print('来电通知投递未确认；未自动重发')
                 except Exception as exc:
                     print('来电通知投递未确认：' + type(exc).__name__)
             return
