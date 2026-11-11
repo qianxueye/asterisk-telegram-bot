@@ -389,8 +389,14 @@ class AgiTests(unittest.TestCase):
 
     def test_dialplan_preserves_existing_routes_and_answer_boundary(self):
         source = (Path(__file__).resolve().parents[1] / 'asterisk-dialplan-integrated.conf').read_text()
+        from_3cx = source.split('[from-3cx]', 1)[1].split('[pbx-rtp-jb]', 1)[0]
+        jitter = source.split('[pbx-rtp-jb]', 1)[1].split('[incoming-mobile]', 1)[0]
         mobile = source.split('[incoming-mobile]', 1)[1].split('[general-sms]', 1)[0]
-        self.assertLess(mobile.index('AGI(inbound_call_agi.py)'), mobile.index('Dial(PJSIP/${EXTEN}@10002)'))
+        self.assertLess(mobile.index('AGI(inbound_call_agi.py)'), mobile.index('Dial(PJSIP/${EXTEN}@10002,'))
+        self.assertLess(from_3cx.index('Gosub(pbx-rtp-jb,s,1)'), from_3cx.index('Dial(Quectel/i:<QUECTEL_IMEI>/${EXTEN})'))
+        self.assertIn('Set(JITTERBUFFER(adaptive)=default)', jitter)
+        self.assertIn('Return()', jitter)
+        self.assertIn('Dial(PJSIP/${EXTEN}@10002,,b(pbx-rtp-jb^s^1))', mobile)
         self.assertNotIn('EAGI_AUDIO_FORMAT', mobile)
         self.assertIn('INBOUND_CALL_SELECTED', mobile)
         self.assertIn('CHANNEL(state)', mobile)
