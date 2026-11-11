@@ -3310,7 +3310,9 @@ class AsteriskBot:
             message = '来电自动处理：Asterisk 已接受发送 ### 指令。\n' + line
             if info['caller']:
                 message += '\n来电号码：' + info['caller']
-            for user in Config.AUTHORIZED_USERS:
+            for user in tuple(Config.AUTHORIZED_USERS):
+                if user not in Config.AUTHORIZED_USERS:
+                    continue
                 try:
                     if await self.send_message(user, message, parse_mode=None) is None:
                         print('来电通知投递未确认；未自动重发')

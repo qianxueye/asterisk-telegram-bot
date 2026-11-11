@@ -475,6 +475,37 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('已收到', call.args[1])
             self.assertIsNone(call.kwargs['parse_mode'])
 
+    async def test_call_event_recipients_survive_authorization_changes_during_send(self):
+        AsteriskBot, Config = self.bot_classes()
+        bot = AsteriskBot.__new__(AsteriskBot)
+        event = {'kind': 'inbound_call', 'event_id': '123.456', 'sim_id': SIM,
+                 'number': PHONE, 'caller': '', 'status': 'accepted'}
+        users = {1, 2, 3}
+        original = tuple(users)
+        sending = asyncio.Event()
+        resume = asyncio.Event()
+
+        async def send(user, message, **kwargs):
+            if user == original[0]:
+                sending.set()
+                await resume.wait()
+            return object()
+
+        bot.send_message = AsyncMock(side_effect=send)
+        with patch.object(Config, 'AUTHORIZED_USERS', users):
+            delivery = asyncio.create_task(bot.deliver_sms_item(event))
+            try:
+                await asyncio.wait_for(sending.wait(), timeout=1)
+                users.remove(original[1])
+                users.update({4, 5})
+                resume.set()
+                await asyncio.wait_for(delivery, timeout=1)
+            finally:
+                delivery.cancel()
+                await asyncio.gather(delivery, return_exceptions=True)
+        self.assertEqual([call.args[0] for call in bot.send_message.await_args_list],
+                         [original[0], original[2]])
+
     async def test_call_event_rejects_bad_fields_and_handles_full_queue(self):
         AsteriskBot, _ = self.bot_classes()
         bot = AsteriskBot.__new__(AsteriskBot)
