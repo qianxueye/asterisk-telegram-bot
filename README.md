@@ -1,5 +1,7 @@
 # Asterisk Telegram Bot
 
+Per-SIM incoming call control is documented in [docs-inbound-call.md](docs-inbound-call.md). It is disabled until a SIM is configured through the authorized Bot command.
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 基于Telethon API开发的高性能Telegram机器人，用于控制Asterisk系统发送短信、查询设备状态和智能检测Silent SMS。

@@ -28,6 +28,7 @@ from telethon.tl.types import UpdateNewMessage, Message
 from telethon.tl.custom import Button
 from config import Config
 from sms_guard import SmsFloodGuard, DEVICE
+from inbound_call import InboundCallPolicy, PolicyWriteUncertain, SIM_ID, DEVICE_ID, normalize_caller, parse_live_line_state, subscriber_number
 
 
 class AsteriskBot:
@@ -38,6 +39,7 @@ class AsteriskBot:
         ('device_statistics', '查看设备统计'), ('recover_numbers', '恢复设备本机号码'),
         ('uac_recover', '检查与恢复 UAC 音频'), ('pending_sms', '查看待确认发送记录'),
         ('sms_notifications', '设置短信发送通知'), ('sms_guard', '短信防护'),
+        ('inbound_call', '按本机号码设置来电处理'),
         ('add_user', '添加授权用户'), ('remove_user', '移除授权用户'),
         ('test_sms_log', '测试短信日志解析'), ('check_sms_logs', '查看近期短信日志'),
     )
@@ -68,8 +70,11 @@ class AsteriskBot:
         self.uac_error_events = defaultdict(list)
         self.uac_recovery_state = self.load_uac_recovery_state()
         self.sms_guard = SmsFloodGuard(os.getenv('SMS_GUARD_STATE_FILE', os.path.join(os.path.dirname(os.path.abspath(__file__)), '.sms_guard_state.json')))
+        self.inbound_call = InboundCallPolicy()
+        self.inbound_call_seen = {}
         self.sms_outbox = asyncio.Queue(maxsize=64)
         self.sms_queue_dropped = 0
+        self.inbound_call_queue_dropped = 0
         self.background_tasks = []
         self.event_handlers_ready = False
         self.setup_sms_pipe()
@@ -473,7 +478,9 @@ class AsteriskBot:
                     return
                 
                 # 检查用户状态
-                if text and text.split()[0].split('@')[0] == '/sms_guard':
+                if text and text.split()[0].split('@')[0] == '/inbound_call':
+                    await self.handle_inbound_call_command(chat_id, text, user_id)
+                elif text and text.split()[0].split('@')[0] == '/sms_guard':
                     await self.handle_sms_guard_command(chat_id, text, user_id)
                 elif user_id in self.user_states:
                     await self.handle_user_state_message(chat_id, user_id, text)
@@ -510,6 +517,8 @@ class AsteriskBot:
                 await self.handle_help_command(chat_id, user_id)
             elif text and text.split()[0].split('@')[0] == '/sms_guard':
                 await self.handle_sms_guard_command(chat_id, text, user_id)
+            elif text and text.split()[0].split('@')[0] == '/inbound_call':
+                await self.handle_inbound_call_command(chat_id, text, user_id)
             elif text.startswith('/send_sms'):
                 await self.handle_send_sms_command(chat_id, text, user_id)
             elif text.startswith('/devices'):
@@ -3075,12 +3084,147 @@ class AsteriskBot:
     def queue_sms_item(self, item):
         try:
             self.sms_outbox.put_nowait(item)
+            return True
         except asyncio.QueueFull:
-            self.sms_queue_dropped += 1
+            if item.get('kind') == 'inbound_call':
+                self.inbound_call_queue_dropped += 1
+                print('来电通知队列已满，通知已丢弃')
+            else:
+                self.sms_queue_dropped += 1
+            return False
 
     def queue_guard_notice(self, device, transition):
         kind, dropped = transition
         self.queue_sms_item({'notice': kind, 'device_id': device, 'dropped': dropped})
+
+    async def read_inbound_lines(self):
+        async def scan_once():
+            output = await self.execute_asterisk_cli('quectel show devices')
+            if not isinstance(output, str) or len(output) > 65536:
+                raise ValueError('line scan')
+            rows = output.splitlines()
+            if not rows or rows[0].split()[:2] != ['ID', 'Group']:
+                raise ValueError('line scan')
+            devices = [row.split()[0] for row in rows[1:] if row.split()]
+            if len(devices) > 4 or len(set(devices)) != len(devices) or any(not DEVICE_ID.fullmatch(device) for device in devices):
+                raise ValueError('line scan')
+            states = await asyncio.gather(*(self.execute_asterisk_cli(f'quectel show device state {device}') for device in devices))
+            return [parse_live_line_state(state, device) for device, state in zip(devices, states)]
+
+        first = await scan_once()
+        second = await scan_once()
+        if first != second:
+            raise ValueError('line changed')
+        return second
+
+    async def handle_inbound_call_command(self, chat_id, text, user_id):
+        if not Config.is_authorized(user_id):
+            return
+        try:
+            parts = text.split()
+            if len(parts) == 1 or parts[1] == 'status':
+                if len(parts) > 2:
+                    raise ValueError('usage')
+                state = self.inbound_call.load()
+                if state is None or not state['sims']:
+                    message = ('来电设置读取失败；来电照常转接 3CX。请联系管理员检查。' if self.inbound_call.path.exists()
+                               and state is None else '来电处理未配置；来电照常转接 3CX。')
+                    await self.send_message(chat_id, message, parse_mode=None)
+                    return
+                labels = {'forward': '转接 3CX', 'direct': '应答并发送 ###'}
+                lines = ['来电处理']
+                for sim, item in sorted(state['sims'].items()):
+                    remaining = max(0, int(item['test_until'] - self.inbound_call.clock()))
+                    name = f"上次选择 {item['number']}" if item['number'] else f"{sim[:sim.index(':')]} 尾号 {sim[-4:]}"
+                    line = f"{name}（SIM 尾号 {sim[-4:]}）：{labels[item['mode']]}"
+                    line += f'，测试：开启（剩余 {remaining} 秒）' if remaining else '，测试：关闭'
+                    lines.append(line)
+                await self.send_message(chat_id, '\n'.join(lines), parse_mode=None)
+                return
+            if len(parts) == 2 and parts[1] == 'lines':
+                lines = await self.read_inbound_lines()
+                policy = self.inbound_call.load()
+                if policy is None and self.inbound_call.path.exists():
+                    raise ValueError('policy file')
+                message = ['当前本机号码']
+                available = False
+                if not lines:
+                    message.append('未发现设备。请检查 /devices。')
+                for line in lines:
+                    if line['inactive']:
+                        message.append(f"{line['device']}：设备未连接或未就绪，暂不可设置。")
+                    elif not line['number']:
+                        message.append(f"{line['device']}：本机号码未读取。请检查 /device_state。")
+                    elif not line['identities']:
+                        message.append(f"{line['number']}：SIM 身份未读取，暂不可设置。请检查 /device_state。")
+                    elif not line['selectable']:
+                        message.append(f"{line['number']}：设备状态未就绪，暂不可设置。")
+                    elif sum(other['number'] == line['number'] for other in lines) > 1 or any(
+                            set(line['identities']) & set(other['identities']) for other in lines if other is not line):
+                        message.append(f"{line['number']}：号码或 SIM 身份重复，暂不可设置。")
+                    elif policy and sum(identity in policy['sims'] for identity in line['identities']) > 1:
+                        message.append(f"{line['number']}：该 SIM 有重复的身份设置，暂不可设置。")
+                    elif policy and any(item['number'] == line['number'] for sim, item in policy['sims'].items()
+                                        if sim not in line['identities']):
+                        message.append(f"{line['number']}：号码已关联另一张 SIM，暂不可设置。")
+                    elif any(not other['number'] or not other['identities'] for other in lines if other is not line and not other['inactive']):
+                        message.append(f"{line['number']}：其他设备状态不完整，暂不可设置。")
+                    else:
+                        message.append(f"{line['number']}：可设置。")
+                        available = True
+                message.append('发送 /inbound_call mode +本机号码 forward|direct。' if available else
+                               '请检查 /devices 和 /device_state，等本机号码与 SIM 身份可用后重试。')
+                await self.send_message(chat_id, '\n'.join(message), parse_mode=None)
+                return
+            if len(parts) != 4:
+                raise ValueError('usage')
+            action, selector, value = parts[1:]
+            if action not in ('mode', 'test'):
+                raise ValueError('usage')
+            if action == 'test':
+                value = int(value)
+            if SIM_ID.fullmatch(selector):
+                self.inbound_call.update(selector, action, value)
+            else:
+                number = subscriber_number(selector)
+                if not number:
+                    raise ValueError('usage')
+                lines = await self.read_inbound_lines()
+                matches = [line for line in lines if line['number'] == number]
+                if len(matches) != 1 or not matches[0]['selectable'] or any(
+                        (not line['number'] or not line['identities']) and not line['inactive'] for line in lines):
+                    raise ValueError('line unavailable')
+                if any(set(matches[0]['identities']) & set(line['identities']) for line in lines if line is not matches[0]):
+                    raise ValueError('line unavailable')
+                self.inbound_call.update_for_identities(matches[0]['identities'], action, value, number)
+        except PolicyWriteUncertain:
+            await self.send_message(chat_id, '保存过程没有返回结果。请查询 /inbound_call status。', parse_mode=None)
+            return
+        except OSError:
+            await self.send_message(chat_id, '来电设置未写入。请联系管理员检查保存目录。', parse_mode=None)
+            return
+        except (ValueError, TypeError) as exc:
+            if isinstance(exc, ValueError) and str(exc) in ('line scan', 'device state', 'duplicate device field', 'device changed', 'line changed'):
+                await self.send_message(chat_id, '设备状态读取失败，设置未保存。请检查 /devices 和 /device_state 后重试。', parse_mode=None)
+                return
+            if isinstance(exc, ValueError) and str(exc) == 'line unavailable':
+                await self.send_message(chat_id, '本机号码或 SIM 身份未读取，或存在重复；设置未保存。请检查 /inbound_call lines。', parse_mode=None)
+                return
+            if isinstance(exc, ValueError) and str(exc) == 'identity conflict':
+                await self.send_message(chat_id, '该 SIM 有重复的身份设置，设置未保存。请联系管理员处理。', parse_mode=None)
+                return
+            if isinstance(exc, ValueError) and str(exc) == 'number reassigned':
+                await self.send_message(chat_id, '该号码已关联另一张 SIM，设置未保存。请联系管理员核对旧设置。', parse_mode=None)
+                return
+            if isinstance(exc, ValueError) and str(exc) == 'policy file':
+                await self.send_message(chat_id, '来电设置读取失败，暂无法按号码设置。请联系管理员检查。', parse_mode=None)
+                return
+            await self.send_message(chat_id,
+                '设置未保存。先发 /inbound_call lines 查看本机号码；再发 /inbound_call mode +本机号码 forward|direct，'
+                '或 /inbound_call test +本机号码 秒数（0-900）。也可使用完整 iccid: 或 imsi: 身份。',
+                parse_mode=None)
+            return
+        await self.send_message(chat_id, '设置已保存。', parse_mode=None)
 
     async def handle_sms_guard_command(self, chat_id, text, user_id):
         if not Config.is_authorized(user_id):
@@ -3116,6 +3260,9 @@ class AsteriskBot:
             info = json.loads(data)
             if not isinstance(info, dict):
                 raise ValueError('SMS envelope type')
+            if info.get('kind') == 'inbound_call':
+                self.process_inbound_call_event(info)
+                return
             device = info['device_id']
             sender = info.get('sender_number', '')
             content = info.get('content', '')
@@ -3138,9 +3285,40 @@ class AsteriskBot:
             self.queue_sms_item({'device_id': device, 'sender_number': sender,
                                  'content': content, 'timestamp': timestamp})
         except (ValueError, TypeError, KeyError, UnicodeError) as exc:
-            print('短信输入已丢弃：' + type(exc).__name__)
+            print('管道输入已丢弃：' + type(exc).__name__)
+
+    def process_inbound_call_event(self, info):
+        if set(info) != {'kind', 'event_id', 'sim_id', 'number', 'caller', 'status'} or info['status'] != 'accepted':
+            raise ValueError('call event fields')
+        event_id, sim_id = info['event_id'], info['sim_id']
+        number, caller = info['number'], info['caller']
+        if (not isinstance(event_id, str) or not re.fullmatch(r'[A-Za-z0-9_.-]{1,100}', event_id) or
+                not isinstance(sim_id, str) or not SIM_ID.fullmatch(sim_id) or
+                not isinstance(number, str) or (number and subscriber_number(number) != number) or
+                not isinstance(caller, str) or (caller and normalize_caller(caller) != caller)):
+            raise ValueError('call event identity')
+        if event_id in self.inbound_call_seen:
+            return
+        if self.queue_sms_item(info):
+            self.inbound_call_seen[event_id] = None
+            if len(self.inbound_call_seen) > 512:
+                del self.inbound_call_seen[next(iter(self.inbound_call_seen))]
 
     async def deliver_sms_item(self, info):
+        if info.get('kind') == 'inbound_call':
+            line = '设置的本机号码：' + info['number'] if info['number'] else 'SIM 尾号：' + info['sim_id'][-4:]
+            message = '来电自动处理：Asterisk 已接受发送 ### 指令。\n' + line
+            if info['caller']:
+                message += '\n来电号码：' + info['caller']
+            for user in tuple(Config.AUTHORIZED_USERS):
+                if user not in Config.AUTHORIZED_USERS:
+                    continue
+                try:
+                    if await self.send_message(user, message, parse_mode=None) is None:
+                        print('来电通知投递未确认；未自动重发')
+                except Exception as exc:
+                    print('来电通知投递未确认：' + type(exc).__name__)
+            return
         if 'notice' in info:
             device = info['device_id']
             message = (f"{device} 短信防护已开启，后续验证码正文丢弃" if info['notice'] == 'start'
