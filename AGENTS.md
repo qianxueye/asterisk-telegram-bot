@@ -1,6 +1,6 @@
 # OpenAI Codex Guidance
 
-> Scope: This file is for OpenAI Codex. Claude Code instructions remain in `CLAUDE.md` and `.claude/`; Claude agents should not treat this file as their instruction source.
+> Scope: This file is for OpenAI Codex; Claude agents should not treat it as their instruction source.
 
 ## Code Review Rules
 
